@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audit thread {{ r.ref }} - {{ r.document }}</title>
+  <style>
+    :root {
+      --ink: #0f172a; --muted: #475569; --faint: #64748b; --rule: #cbd5e1; --soft: #f1f5f9; --bg: #e2e8f0; --paper: #ffffff;
+      --good: #047857; --bad: #b91c1c; --warn: #b45309;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body { margin: 0; color: var(--ink); font: 13px/1.45 "Segoe UI", Inter, system-ui, -apple-system, Arial, sans-serif; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .toolbar { position: sticky; top: 0; z-index: 5; display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 10px 20px; background: #0f172a; color: #e2e8f0; }
+    .toolbar button, .toolbar a { font: inherit; border: 0; border-radius: 6px; padding: 7px 14px; background: #f8fafc; color: #0f172a; text-decoration: none; cursor: pointer; font-weight: 600; }
+    .toolbar span { color: #94a3b8; font-size: 12px; }
+    .sheet { max-width: 900px; margin: 18px auto; padding: 36px 44px 48px; background: var(--paper); box-shadow: 0 2px 14px rgba(15,23,42,.18); }
+    .firm { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 3px double var(--ink); padding-bottom: 10px; }
+    .firm h1 { margin: 0; font-size: 20px; letter-spacing: .02em; }
+    .firm .sub { color: var(--muted); font-size: 12px; text-align: right; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 26px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--rule); }
+    .title { margin: 18px 0 4px; font-size: 18px; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; }
+    .meta td { padding: 5px 10px 5px 0; vertical-align: top; }
+    .meta td.k { width: 17%; color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding-top: 7px; }
+    .meta td.v { width: 33%; font-weight: 600; }
+    .stat { display: flex; gap: 0; border: 1px solid var(--rule); border-radius: 4px; overflow: hidden; }
+    .stat div { flex: 1; padding: 8px 12px; border-right: 1px solid var(--rule); }
+    .stat div:last-child { border-right: 0; }
+    .stat b { display: block; font-size: 17px; }
+    .stat small { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; border: 1px solid var(--rule); background: var(--soft); }
+    .pill.mat { background: #be123c; color: #fff; border-color: #be123c; }
+    .pill.bad { background: #fee2e2; color: var(--bad); border-color: #fecaca; }
+    .pill.good { background: #d1fae5; color: var(--good); border-color: #a7f3d0; }
+    .pill.warn { background: #fef3c7; color: var(--warn); border-color: #fde68a; }
+    table.tl th, table.sub th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); border-bottom: 1px solid var(--ink); padding: 6px 8px; }
+    table.tl td, table.sub td { padding: 7px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+    table.tl tr, table.sub tr { page-break-inside: avoid; break-inside: avoid; }
+    table.tl td.seq { width: 34px; color: var(--faint); font-family: Consolas, monospace; }
+    table.tl td.when { width: 128px; white-space: nowrap; }
+    table.tl td.ev { width: 150px; font-weight: 700; }
+    .detail { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .detail b { color: var(--ink); font-weight: 600; }
+    .mono { font-family: Consolas, "Courier New", monospace; font-size: 11px; word-break: break-all; }
+    .sub-card { border: 1px solid var(--rule); border-radius: 4px; margin-bottom: 12px; page-break-inside: avoid; break-inside: avoid; }
+    .sub-card header { display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; background: var(--soft); border-bottom: 1px solid var(--rule); }
+    .sub-card .note { padding: 7px 10px; border-top: 1px solid var(--rule); font-size: 12px; color: var(--muted); }
+    .integrity { margin-top: 26px; padding: 12px 14px; border: 1px solid var(--ink); border-radius: 4px; font-size: 12px; page-break-inside: avoid; break-inside: avoid; }
+    .integrity .mono { display: block; margin-top: 3px; }
+    .sign { display: flex; gap: 40px; margin-top: 34px; }
+    .sign div { flex: 1; border-top: 1px solid var(--ink); padding-top: 4px; color: var(--faint); font-size: 11px; }
+    .running-foot { display: none; }
+    @page { size: A4; margin: 16mm 14mm 18mm; }
+    @media print {
+      html, body { background: #fff; }
+      .toolbar { display: none; }
+      .sheet { max-width: none; margin: 0; padding: 0; box-shadow: none; }
+      thead { display: table-header-group; }
+      .running-foot { display: block; position: fixed; bottom: 0; left: 0; right: 0; font-size: 9px; color: var(--faint); border-top: 1px solid var(--rule); padding-top: 3px; }
+      a { color: inherit; text-decoration: none; }
+    }
+    @media (max-width: 640px) { .sheet { padding: 20px 16px; } .meta td.k, .meta td.v { display: block; width: auto; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div><a href="/?eng={{ eng.id }}">&larr; Back to the ledger</a></div>
+    <span>Use Print &rarr; "Save as PDF" for the file you hand over.</span>
+    <button type="button" onclick="window.print()">Print / Save as PDF</button>
+  </div>
+
+  <div class="sheet">
+    <div class="firm">
+      <h1>{{ firm_name }}</h1>
+      <div class="sub">Document Request Ledger<br>Audit thread - evidence of what was asked, when, how, and what came back</div>
+    </div>
+
+    <div class="title">{{ r.document }}</div>
+    <div>
+      <span class="pill {{ 'mat' if r.significance == 'Material' else '' }}">{{ 'Material to the opinion' if r.significance == 'Material' else 'Routine' }}</span>
+      <span class="pill {{ 'good' if r.state == 'Accepted' else ('bad' if r.state == 'Unfulfilled at report date' else 'warn') }}">{{ r.state }}</span>
+    </div>
+
+    <h2>Request</h2>
+    <table class="meta">
+      <tr><td class="k">Firm</td><td class="v">{{ firm_name }}</td><td class="k">Reference</td><td class="v">{{ r.ref }}</td></tr>
+      <tr><td class="k">Engagement</td><td class="v">{{ eng.name }}</td><td class="k">Document</td><td class="v">{{ r.document }}</td></tr>
+      <tr><td class="k">Client</td><td class="v">{{ eng.client_name }}</td><td class="k">Client owner</td><td class="v">{{ r.owner_person }}</td></tr>
+      <tr><td class="k">Engagement period</td><td class="v">{{ eng.period_from|fdate }} to {{ eng.period_to|fdate }}</td><td class="k">Period asked for</td><td class="v">{{ period_text(r) }}</td></tr>
+      <tr><td class="k">Engagement type</td><td class="v">{{ eng.engagement_type }}</td><td class="k">Significance</td><td class="v">{{ r.significance }} · priority P{{ r.priority }}</td></tr>
+      <tr><td class="k">Raised</td><td class="v">{{ r.created_at|ist }} by {{ r.created_by }}</td><td class="k">Engagement status</td><td class="v">{{ eng.status }}{% if eng.status == 'Closed' %} · report date {{ eng.report_date|fdate }}{% endif %}</td></tr>
+      {% if r.description %}<tr><td class="k">Asked for as</td><td class="v" colspan="3" style="font-weight:400">{{ r.description }}</td></tr>{% endif %}
+      {% if r.template_item or r.condition_basis %}<tr><td class="k">Origin</td><td class="v" colspan="3" style="font-weight:400">{{ r.template_item or '' }}{% if r.condition_basis %} · {{ r.condition_basis }}{% endif %}</td></tr>{% endif %}
+      {% if carried_note %}<tr><td class="k">Carried forward</td><td class="v" colspan="3" style="font-weight:400">{{ carried_note }}{% if carried_from %} (prior request {{ carried_from.ref }}){% endif %}</td></tr>{% endif %}
+    </table>
+
+    <h2>Position at {{ now|ist }}</h2>
+    <div class="stat">
+      <div><b>{{ r.state }}</b><small>State</small></div>
+      <div><b>{{ r.attempt_count }}</b><small>Attempts</small></div>
+      <div><b>{{ r.chase_count }}</b><small>Chases</small></div>
+      <div><b>{{ r.submissions|length }}</b><small>Submissions</small></div>
+      <div><b>{{ arrival_total }}</b><small>Identical re-sends</small></div>
+      <div><b>{{ r.age_days(now) }}d</b><small>{{ 'Outstanding' if r.is_open else 'To close-out' }}</small></div>
+    </div>
+    {% if r.attempt_count >= 3 %}
+    <p style="margin:8px 0 0;color:var(--warn)"><b>Attempt {{ r.attempt_count }}:</b> a third attempt on the same document is a management-letter point about the client's records.</p>
+    {% endif %}
+
+    <h2>Timeline <span style="text-transform:none;letter-spacing:0;font-weight:400">- {{ r.events|length }} events, in the order they were recorded</span></h2>
+    <table class="tl">
+      <thead><tr><th>#</th><th>When (IST)</th><th>Event</th><th>By · channel · detail</th></tr></thead>
+      <tbody>
+        {% for ev in r.events %}
+        <tr>
+          <td class="seq">{{ ev.seq }}</td>
+          <td class="when">{{ ev.at|ist('%d %b %Y, %H:%M') }}</td>
+          <td class="ev">{{ ev.label }}{% if ev.event_type == 'REJECTED' %}<div class="detail" style="color:var(--bad)"><b>{{ (ev.payload or {}).get('reason_label', '') }}</b></div>{% endif %}</td>
+          <td>
+            {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
+            {% set items = payload_items(ev) %}
+            {% if items %}<div class="detail">{% for label, value in items %}<b>{{ label }}:</b> {{ value }}{{ ' · ' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h2>Submissions, content hashes and arrivals</h2>
+    {% if not r.submissions %}
+      <p style="color:var(--muted)">Nothing has been submitted against this request.</p>
+    {% endif %}
+    {% for sub in r.submissions %}
+    <div class="sub-card">
+      <header>
+        <div><b>Attempt {{ sub.attempt_number }}</b> · received {{ sub.received_at|ist }} via {{ sub.channel }}{% if sub.submitted_by %} from {{ sub.submitted_by }}{% endif %}</div>
+        <div>
+          {% if sub.outcome == 'accepted' %}<span class="pill good">Accepted</span>
+          {% elif sub.outcome == 'rejected' %}{% set rc = reason_codes.get(sub.reason_code) %}<span class="pill bad">Rejected - {{ rc[0] if rc else sub.reason_code }}</span>
+          {% else %}<span class="pill warn">Awaiting review</span>{% endif %}
+        </div>
+      </header>
+      <table class="sub">
+        <thead><tr><th>Page</th><th>File</th><th>Size</th><th>SHA-256</th><th>Arrivals</th></tr></thead>
+        <tbody>
+          {% for f in sub.files %}
+          <tr>
+            <td>{{ f.page_order }}</td>
+            <td>{{ f.filename }}</td>
+            <td>{{ f.file_bytes_size|fsize }}</td>
+            <td class="mono">{{ f.content_hash }}</td>
+            <td>{{ 1 + f.arrivals|length }}
+              {% if f.arrivals %}<div class="detail">first receipt, then re-sent
+                {% for a in f.arrivals %}{{ a.arrived_at|ist('%d %b, %H:%M') }} via {{ a.channel }}{{ '; ' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if sub.outcome != 'pending' %}
+      <div class="note">
+        Reviewed by <b>{{ sub.reviewed_by }}</b>, {{ sub.reviewed_at|ist }}.
+        {% if sub.outcome == 'rejected' %}{% set rc = reason_codes.get(sub.reason_code) %}{% if rc %}Client was told: "{{ rc[1] }}"{% endif %}{% endif %}
+        {% if sub.review_notes %} Reviewer's note: {{ sub.review_notes }}{% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    <div class="integrity">
+      <b>Integrity of this thread.</b>
+      The ledger is append-only: events are never edited or deleted, and each carries the next sequence number.
+      Sequence {{ '1 to ' ~ r.events|length ~ ' is complete and gap-free.' if seq_ok else 'HAS A GAP - investigate before relying on this printout.' }}
+      File hashes are SHA-256 of the exact bytes received.
+      <span class="mono">Thread fingerprint (SHA-256 of all {{ r.events|length }} events): {{ fingerprint }}</span>
+    </div>
+
+    <div class="sign">
+      <div>Prepared by{% if exported_by %}: {{ exported_by }}{% endif %}</div>
+      <div>Reviewed by</div>
+      <div>Date</div>
+    </div>
+    <p style="margin-top:14px;color:var(--faint);font-size:11px">Generated {{ now|ist }}{% if exported_by %} by {{ exported_by }}{% endif %} · {{ firm_name }} · {{ eng.name }} · {{ r.ref }}</p>
+  </div>
+
+  <div class="running-foot">{{ firm_name }} · {{ eng.name }} · {{ r.ref }} · fingerprint {{ fingerprint[:16] }}... · generated {{ now|ist }}</div>
+</body>
+</html>

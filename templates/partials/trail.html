@@ -1,0 +1,288 @@
+{# Audit-trail drawer body: request summary, legal next actions, and the full sequential history. #}
+<div class="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+  <div class="min-w-0">
+    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+      <span class="font-mono font-semibold text-slate-700">{{ r.ref }}</span>
+      <span>·</span><span>{{ r.engagement.name }}</span>
+    </div>
+    <h2 class="mt-1 text-lg font-semibold leading-snug text-slate-900">{{ r.document }}</h2>
+    <div class="mt-2 flex flex-wrap items-center gap-2">
+      <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset {{ state_style(r.state) }}">{{ r.state }}</span>
+      {% if r.significance == 'Material' %}
+        <span class="inline-flex items-center rounded-full bg-rose-600 px-2.5 py-0.5 text-xs font-semibold text-white">Material to opinion</span>
+      {% else %}
+        <span class="inline-flex items-center rounded-full bg-slate-200 px-2.5 py-0.5 text-xs font-medium text-slate-700">Routine</span>
+      {% endif %}
+      {% if r.attempt_count >= 3 %}
+        <span class="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-inset ring-amber-300"
+              title="A third attempt on the same document is a management-letter point about the client's records.">Attempt {{ r.attempt_count }} · management-letter point</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="flex shrink-0 items-center gap-2">
+    {% if r.state in chaseable_states and r.engagement.status == 'Active' %}
+    <button type="button" data-chase="{{ r.id }}" data-ref="{{ r.ref }}" data-doc="{{ r.document }}" data-owner="{{ r.owner_person }}" data-age="{{ r.age_days(now) }}"
+            class="rounded-md border border-orange-300 bg-orange-50 px-3 py-1.5 text-xs font-semibold text-orange-900 hover:bg-orange-100">Record chase</button>
+    {% endif %}
+    <a href="/engagements/{{ r.engagement_id }}/requests/{{ r.ref }}/export" target="_blank" rel="noopener" data-export
+       class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100" title="Printable audit thread - Save as PDF">Export thread</a>
+  <button type="button" data-close-drawer class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-800" aria-label="Close">
+    <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+  </button>
+  </div>
+</div>
+
+<dl class="grid grid-cols-2 gap-x-4 gap-y-3 border-b border-slate-200 bg-slate-50 px-5 py-4 text-sm">
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Client owner</dt><dd class="font-medium">{{ r.owner_person }}</dd></div>
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Period asked for</dt><dd class="font-medium">{{ period_text(r) }}</dd></div>
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Attempt</dt><dd class="font-medium">{{ r.attempt_count }}</dd></div>
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Chases</dt><dd class="font-medium">{{ r.chase_count }}</dd></div>
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Age</dt><dd class="font-medium">{{ r.age_days(now) }} day{{ '' if r.age_days(now) == 1 else 's' }}{% if not r.is_open %} (closed out){% endif %}</dd></div>
+  <div><dt class="text-xs uppercase tracking-wide text-slate-500">Priority</dt><dd class="font-medium">P{{ r.priority }}</dd></div>
+  {% if r.description %}
+  <div class="col-span-2"><dt class="text-xs uppercase tracking-wide text-slate-500">Description</dt><dd>{{ r.description }}</dd></div>
+  {% endif %}
+  {% if carried_note %}
+  <div class="col-span-2"><dt class="text-xs uppercase tracking-wide text-slate-500">Carried forward</dt>
+    <dd><span class="mr-1 inline-flex rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-900">{{ carried_note.split(' - ')[0] }}</span>{{ carried_note.split(' - ', 1)[1] if ' - ' in carried_note else '' }}{% if carried_from %} <span class="text-slate-500">(prior request {{ carried_from.ref }})</span>{% endif %}</dd></div>
+  {% endif %}
+  {% if r.template_item or r.condition_basis %}
+  <div class="col-span-2"><dt class="text-xs uppercase tracking-wide text-slate-500">Origin</dt>
+    <dd>{{ r.template_item or '' }}{% if r.condition_basis %} · condition: {{ r.condition_basis }}{% endif %}</dd></div>
+  {% endif %}
+</dl>
+
+{# ================= Stage 3: flash, audit review, submit, submission history ================= #}
+<div id="drawer-flash" class="hidden border-b border-emerald-200 bg-emerald-50 px-5 py-3 text-sm text-emerald-900"></div>
+
+{% set pend = pending_submission(r) %}
+{% set active = r.engagement.status == 'Active' %}
+
+{% if active and pend and r.state in ['Submitted', 'Under review'] %}
+<section id="review-panel" data-submission="{{ pend.id }}" data-request="{{ r.id }}" class="border-b border-violet-200 bg-violet-50 px-5 py-4">
+  <div class="flex items-center justify-between">
+    <h3 class="text-sm font-semibold text-violet-950">Audit review</h3>
+    <span class="rounded-full bg-violet-200 px-2 py-0.5 text-xs font-medium text-violet-900">Attempt {{ pend.attempt_number }} awaiting a decision</span>
+  </div>
+  <ul class="mt-2 space-y-1 text-sm">
+    {% for f in pend.files %}
+    <li class="flex flex-wrap items-center gap-x-2">
+      <span class="font-mono text-xs text-slate-400">p{{ f.page_order }}</span>
+      <a href="/files/{{ f.id }}" class="font-medium text-sky-800 hover:underline">{{ f.filename }}</a>
+      <span class="text-xs text-slate-500">{{ f.file_bytes_size|fsize }}</span>
+      <span class="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-100" title="SHA-256 {{ f.content_hash }}">sha256:{{ f.content_hash[:12] }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+
+  <label class="mt-3 block text-xs font-medium text-slate-600" for="review-note">Review note (optional)</label>
+  <input id="review-note" type="text" maxlength="2000" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm" placeholder="e.g. Closing balances agree to the trial balance">
+
+  <div class="mt-3 flex flex-wrap gap-2">
+    {% if r.state == 'Submitted' %}
+    <button type="button" id="start-review" class="rounded-md border border-violet-300 bg-white px-3 py-2 text-sm font-medium text-violet-900 hover:bg-violet-100">Start review</button>
+    {% endif %}
+    <button type="button" id="accept-doc" class="rounded-md bg-emerald-600 px-3.5 py-2 text-sm font-semibold text-white hover:bg-emerald-700">Accept Document</button>
+    <button type="button" id="reject-doc" class="rounded-md bg-rose-600 px-3.5 py-2 text-sm font-semibold text-white hover:bg-rose-700">Reject Document</button>
+  </div>
+
+  <div id="reject-box" class="mt-3 hidden rounded-md border border-rose-200 bg-white p-3">
+    <label class="block text-xs font-medium text-slate-600" for="reject-code">Reason code (what the client will be told to do differently)</label>
+    <select id="reject-code" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+      <option value="">Choose a reason...</option>
+      {% for code, (label, msg) in reason_codes.items() %}
+      <option value="{{ code }}" data-message="{{ msg }}">{{ label }}</option>
+      {% endfor %}
+    </select>
+    <p id="reject-explainer" class="mt-2 hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-900 ring-1 ring-rose-200"></p>
+    <p class="mt-2 text-xs text-slate-500">Rejecting records the rejection and immediately re-requests the document (attempt {{ r.attempt_count + 1 }}). The request stays live.</p>
+    <div class="mt-2 flex gap-2">
+      <button type="button" id="confirm-reject" class="rounded-md bg-rose-600 px-3 py-2 text-sm font-semibold text-white hover:bg-rose-700">Confirm rejection</button>
+      <button type="button" id="cancel-reject" class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-100">Cancel</button>
+    </div>
+  </div>
+  <p id="review-error" class="mt-3 hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+</section>
+{% endif %}
+
+{% if active and r.state != 'Drafted' %}
+<section class="border-b border-slate-200 px-5 py-4">
+  <details {{ 'open' if r.state in ['Sent', 'Acknowledged', 'Re-requested'] and not r.submissions else '' }}>
+    <summary class="cursor-pointer text-sm font-semibold text-slate-900">Submit document <span class="font-normal text-slate-500">(test upload)</span></summary>
+    <form id="submit-form" data-request-id="{{ r.id }}" class="mt-3 space-y-3" enctype="multipart/form-data">
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="sub-files">File(s) - PDF, image or any text file</label>
+        <input id="sub-files" type="file" name="files" multiple required class="mt-1 block w-full text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-slate-700">
+        <p class="mt-1 text-xs text-slate-500">Several files become the pages of ONE submission, in the order chosen. Content already held for this request (same SHA-256) is not stored again - it is recorded as an arrival.</p>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="sub-channel">Arrived via</label>
+          <select id="sub-channel" name="channel" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+            {% for c in channels %}<option value="{{ c }}" {{ 'selected' if c == 'Web upload' else '' }}>{{ c }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="sub-by">Submitted by</label>
+          <input id="sub-by" type="text" name="submitted_by" value="{{ r.owner_person }}" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm">
+        </div>
+      </div>
+      <p id="submit-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+      <button type="submit" class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Submit</button>
+    </form>
+  </details>
+</section>
+{% endif %}
+
+<section class="border-b border-slate-200 px-5 py-4">
+  <h3 class="text-sm font-semibold text-slate-900">Submission history <span class="font-normal text-slate-500">· {{ r.submissions|length }} attempt{{ '' if r.submissions|length == 1 else 's' }}</span></h3>
+  {% if not r.submissions %}
+  <p class="mt-2 text-sm text-slate-500">Nothing has been submitted against this request yet.</p>
+  {% endif %}
+  <div class="mt-3 space-y-3">
+    {% for sub in r.submissions|reverse %}
+    <div class="rounded-lg border border-slate-200 bg-white">
+      <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-3 py-2">
+        <div class="text-sm font-semibold text-slate-900">Attempt {{ sub.attempt_number }}
+          <span class="ml-1 text-xs font-normal text-slate-500">{{ sub.received_at|ist }} · {{ sub.channel }}{% if sub.submitted_by %} · {{ sub.submitted_by }}{% endif %}</span>
+        </div>
+        <div class="flex flex-wrap items-center gap-1.5">
+          {% if sub.outcome == 'pending' %}
+            <span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 ring-1 ring-inset ring-amber-300">Awaiting review</span>
+          {% elif sub.outcome == 'accepted' %}
+            <span class="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-900 ring-1 ring-inset ring-emerald-300">Accepted</span>
+          {% else %}
+            <span class="rounded-full bg-rose-100 px-2 py-0.5 text-xs font-medium text-rose-900 ring-1 ring-inset ring-rose-300">Rejected</span>
+            {% set rc = reason_codes.get(sub.reason_code) %}
+            <span class="rounded-full bg-rose-600 px-2 py-0.5 text-xs font-semibold text-white" title="{{ rc[1] if rc else '' }}">{{ rc[0] if rc else sub.reason_code }}</span>
+          {% endif %}
+        </div>
+      </div>
+      <ul class="divide-y divide-slate-100">
+        {% for f in sub.files %}
+        <li class="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-sm">
+          <span class="font-mono text-xs text-slate-400">p{{ f.page_order }}</span>
+          <a href="/files/{{ f.id }}" class="font-medium text-sky-800 hover:underline">{{ f.filename }}</a>
+          <span class="text-xs text-slate-500">{{ f.file_bytes_size|fsize }}</span>
+          <span class="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-100" title="SHA-256 {{ f.content_hash }}">sha256:{{ f.content_hash[:12] }}</span>
+          {% if f.arrivals %}
+          <span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 ring-1 ring-inset ring-amber-300"
+                title="Identical content arrived again {{ f.arrivals|length }} time(s)">Re-sent &times;{{ f.arrivals|length }} · arrived {{ 1 + f.arrivals|length }} times</span>
+          {% endif %}
+          {% if f.arrivals %}
+          <div class="w-full pl-6 text-[11px] text-slate-500">
+            {% for a in f.arrivals %}Identical content arrived again {{ a.arrived_at|ist }} via {{ a.channel }}{% if a.submitted_by %} ({{ a.submitted_by }}){% endif %}{{ '; ' if not loop.last else '' }}{% endfor %}
+          </div>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% if sub.outcome != 'pending' %}
+      <div class="border-t border-slate-100 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+        Reviewed by {{ sub.reviewed_by }} · {{ sub.reviewed_at|ist }}
+        {% if sub.outcome == 'rejected' %}{% set rc = reason_codes.get(sub.reason_code) %}{% if rc %}<div class="mt-0.5 text-rose-800">Told to client: {{ rc[1] }}</div>{% endif %}{% endif %}
+        {% if sub.review_notes %}<div class="mt-0.5">Note: {{ sub.review_notes }}</div>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{# ---- Record the next event ---- #}
+<section class="border-b border-slate-200 px-5 py-4">
+  <h3 class="text-sm font-semibold text-slate-900">Record the next event</h3>
+  {% if actions %}
+  <form id="event-form" data-request-id="{{ r.id }}" class="mt-3 space-y-3">
+    <div>
+      <label class="block text-xs font-medium text-slate-600" for="ev-type">What happened</label>
+      <select id="ev-type" name="event_type" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+        {% for value, label in actions %}<option value="{{ value }}">{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+
+    <div data-fields="SENT,CHASED,ACKNOWLEDGED,SUBMITTED">
+      <label class="block text-xs font-medium text-slate-600">Channel</label>
+      <select name="channel" required class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+        {% for c in channels %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </select>
+    </div>
+
+    <div data-fields="REJECTED">
+      <label class="block text-xs font-medium text-slate-600">Reason code</label>
+      <select name="reason_code" required class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+        {% for code, (label, msg) in reason_codes.items() %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
+      </select>
+      <p class="mt-1 text-xs text-slate-500">Rejecting appends a Rejected event and an automatic Re-requested event (next attempt).</p>
+      <label class="mt-2 block text-xs font-medium text-slate-600">Detail for the client (optional)</label>
+      <input type="text" name="detail" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm" placeholder="e.g. Pages 4-6 are missing">
+    </div>
+
+    <div data-fields="WAIVED,NOT_APPLICABLE">
+      <label class="block text-xs font-medium text-slate-600">Reason (recorded decision)</label>
+      <textarea name="reason" rows="2" required class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm"
+                placeholder="Why is this being waived / not applicable?"></textarea>
+    </div>
+
+    <div data-fields="SUBMITTED">
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600">Submitted by</label>
+          <input type="text" name="submitted_by" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm" value="{{ r.owner_person }}">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600">File name (optional)</label>
+          <input type="text" name="filename" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm">
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <label class="block text-xs font-medium text-slate-600">Note <span class="font-normal text-slate-400">(required for a plain note)</span></label>
+      <input type="text" name="note" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm">
+    </div>
+
+    <p id="event-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+    <button type="submit" class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Append to history</button>
+  </form>
+  {% else %}
+  <p class="mt-2 text-sm text-slate-500">No further events can be recorded.</p>
+  {% endif %}
+</section>
+
+{# ---- The history ---- #}
+<section class="px-5 py-4">
+  <div class="flex items-center justify-between">
+    <h3 class="text-sm font-semibold text-slate-900">Audit trail <span class="font-normal text-slate-500">· {{ r.events|length }} event{{ '' if r.events|length == 1 else 's' }}</span></h3>
+    <a href="/api/requests/{{ r.id }}/events" target="_blank" class="text-xs text-sky-700 hover:underline">JSON</a>
+  </div>
+  <p class="mt-1 text-xs text-slate-500">Append-only. Events are never edited or deleted; every change is a new row.</p>
+
+  <ol class="mt-4">
+    {% for ev in r.events %}
+    <li class="relative pb-6 pl-8 last:pb-0">
+      {% if not loop.last %}<span class="absolute left-[11px] top-5 h-full w-px bg-slate-200"></span>{% endif %}
+      <span class="absolute left-0 top-0.5 flex h-6 w-6 items-center justify-center rounded-full bg-white ring-2 ring-slate-200">
+        <span class="h-2.5 w-2.5 rounded-full {{ event_dot(ev.event_type) }}"></span>
+      </span>
+      <div class="flex flex-wrap items-baseline justify-between gap-x-3">
+        <div class="text-sm font-semibold text-slate-900">
+          <span class="mr-1.5 font-mono text-xs font-normal text-slate-400">#{{ ev.seq }}</span>{{ ev.label }}
+        </div>
+        <time class="text-xs text-slate-500" datetime="{{ ev.at.isoformat() }}" title="{{ ev.at.isoformat() }}">{{ ev.at|ist }}</time>
+      </div>
+      <div class="text-xs text-slate-600">
+        by {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
+      </div>
+      {% set items = payload_items(ev) %}
+      {% if items %}
+      <dl class="mt-1.5 space-y-0.5 rounded-md bg-slate-50 px-3 py-2 text-xs ring-1 ring-slate-200">
+        {% for label, value in items %}
+        <div class="flex gap-2"><dt class="w-28 shrink-0 text-slate-500">{{ label }}</dt><dd class="text-slate-800">{{ value }}</dd></div>
+        {% endfor %}
+      </dl>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ol>
+</section>

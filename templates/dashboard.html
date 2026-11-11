@@ -1,0 +1,799 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+{% if not selected %}
+  <div class="rounded-lg border border-dashed border-slate-300 bg-white p-10 text-center text-slate-500">
+    No engagements yet. Run <code class="rounded bg-slate-100 px-1.5 py-0.5">python seed_demo.py</code> to load the demo engagement.
+  </div>
+{% else %}
+
+{# ---------------- Engagements ---------------- #}
+<section aria-label="Engagements">
+  <h2 class="text-xs font-semibold uppercase tracking-wide text-slate-500">Engagements</h2>
+  <div class="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+    {% for c in cards %}
+      {% set e = c.engagement %}
+      <a href="/?eng={{ e.id }}"
+         class="block rounded-lg border bg-white p-4 shadow-sm transition hover:border-slate-400 {{ 'border-slate-900 ring-1 ring-slate-900' if e.id == selected.id else 'border-slate-200' }}">
+        <div class="flex items-start justify-between gap-2">
+          <div class="font-semibold text-slate-900">{{ e.name }}</div>
+          <span class="shrink-0 rounded-full px-2 py-0.5 text-xs font-medium {{ 'bg-emerald-100 text-emerald-800' if e.status == 'Active' else 'bg-slate-200 text-slate-600' }}">{{ e.status }}</span>
+        </div>
+        <div class="mt-0.5 text-xs text-slate-500">{{ e.client_name }} · {{ e.engagement_type }}</div>
+        <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600">
+          <span><b class="text-slate-900">{{ c.stats.total }}</b> raised</span>
+          <span><b class="text-emerald-700">{{ c.stats.accepted }}</b> accepted</span>
+          <span><b class="text-rose-700">{{ c.stats.open_material }}</b> open material</span>
+          <span><b class="text-slate-900">{{ c.stats.open_routine }}</b> open routine</span>
+        </div>
+      </a>
+    {% endfor %}
+  </div>
+</section>
+
+{# ---------------- Selected engagement ---------------- #}
+<section class="mt-8" aria-label="Requests">
+  <div class="flex flex-wrap items-end justify-between gap-3">
+    <div>
+      <h2 class="text-xl font-semibold text-slate-900">{{ selected.name }}</h2>
+      <p class="text-sm text-slate-500">
+        {{ selected.client_name }} · {{ selected.engagement_type }} · {{ selected.period_from|fdate }} to {{ selected.period_to|fdate }}
+        {% if selected.status == 'Closed' %} · <span class="font-medium text-slate-700">Closed, report date {{ selected.report_date|fdate }}</span>{% endif %}
+      </p>
+    </div>
+    {% if selected.status == 'Active' %}
+    <div class="flex flex-wrap gap-2">
+      <button id="open-profile" type="button" data-engagement="{{ selected.id }}"
+              class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Entity profile</button>
+      <button id="open-requirements" type="button" data-engagement="{{ selected.id }}"
+              class="rounded-md border border-sky-600 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-800 hover:bg-sky-100">Requirement list</button>
+      <button id="close-engagement" type="button" data-engagement="{{ selected.id }}"
+              class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Close out engagement</button>
+      <button id="open-modal" type="button"
+              class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">+ New request</button>
+    </div>
+    {% endif %}
+  </div>
+
+  {# ---- Day-forty summary ---- #}
+  <div class="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+    {% for label, value, tone in [
+      ('Raised', stats.total, 'text-slate-900'),
+      ('Accepted', stats.accepted, 'text-emerald-700'),
+      ('Open · material', stats.open_material, 'text-rose-700'),
+      ('Open · routine', stats.open_routine, 'text-slate-900'),
+      ('Waived / N/A', stats.waived_na, 'text-stone-600'),
+      ('Unfulfilled at report date', stats.unfulfilled, 'text-red-700'),
+    ] %}
+    <div class="rounded-lg border border-slate-200 bg-white px-4 py-3">
+      <div class="text-2xl font-semibold {{ tone }}">{{ value }}</div>
+      <div class="text-xs text-slate-500">{{ label }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  {# ---- Ledger / Outstanding Board switch ---- #}
+  <div class="mt-6 inline-flex overflow-hidden rounded-lg border border-slate-300 bg-white text-sm shadow-sm" role="tablist" aria-label="View">
+    <button type="button" role="tab" data-view="ledger" aria-selected="true" class="view-tab bg-slate-900 px-4 py-2 font-medium text-white">Ledger</button>
+    <button type="button" role="tab" data-view="board" aria-selected="false" class="view-tab px-4 py-2 font-medium text-slate-700 hover:bg-slate-100">Outstanding Board</button>
+  </div>
+
+  <div id="ledger-panel">
+  {# ---- Filter chips (material + open rows are pinned and never filtered away) ---- #}
+  <div class="mt-5 flex flex-wrap items-center gap-2 text-sm" id="filters">
+    <span class="text-xs uppercase tracking-wide text-slate-500">Show</span>
+    {% for key, label in [('all','All'),('open','Open'),('done','Closed out')] %}
+      <button type="button" data-filter="{{ key }}"
+              class="filter-chip rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100">{{ label }}</button>
+    {% endfor %}
+    <span class="text-xs text-slate-400">Material &amp; open requests stay pinned to the top regardless.</span>
+  </div>
+
+  {# ---- Request list ---- #}
+  <div class="mt-3 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+    <table class="min-w-full divide-y divide-slate-200 text-sm">
+      <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+        <tr>
+          <th class="px-4 py-2.5 font-medium">Ref</th>
+          <th class="px-4 py-2.5 font-medium">Document</th>
+          <th class="px-4 py-2.5 font-medium">Client owner</th>
+          <th class="px-4 py-2.5 font-medium">Significance</th>
+          <th class="px-4 py-2.5 font-medium">Status</th>
+          <th class="px-4 py-2.5 text-right font-medium">Attempt</th>
+          <th class="px-4 py-2.5 text-right font-medium">Chases</th>
+          <th class="px-4 py-2.5 text-right font-medium">Age</th>
+          <th class="px-4 py-2.5 text-right font-medium"><span class="sr-only">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        {% for r in requests %}
+        {% set age = r.age_days(now) %}
+        <tr class="request-row cursor-pointer hover:bg-slate-50 {{ 'bg-rose-50/60' if r.is_material_open else '' }}"
+            data-id="{{ r.id }}" data-open="{{ 1 if r.is_open else 0 }}" data-pinned="{{ 1 if r.is_material_open else 0 }}"
+            tabindex="0" role="button" aria-label="Open audit trail for {{ r.ref }}">
+          <td class="whitespace-nowrap px-4 py-3 font-mono text-xs text-slate-600">
+            {{ r.ref }}<div class="text-[11px] text-slate-400">P{{ r.priority }}</div>
+          </td>
+          <td class="px-4 py-3">
+            <div class="font-medium text-slate-900">{{ r.document }}</div>
+            <div class="text-xs text-slate-500">{{ period_text(r) }}</div>
+          </td>
+          <td class="px-4 py-3 text-slate-700">{{ r.owner_person }}</td>
+          <td class="whitespace-nowrap px-4 py-3">
+            {% if r.significance == 'Material' %}
+              <span class="inline-flex items-center rounded-full bg-rose-600 px-2.5 py-0.5 text-xs font-semibold text-white">Material</span>
+            {% else %}
+              <span class="inline-flex items-center rounded-full bg-slate-200 px-2.5 py-0.5 text-xs font-medium text-slate-700">Routine</span>
+            {% endif %}
+          </td>
+          <td class="whitespace-nowrap px-4 py-3">
+            <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset {{ state_style(r.state) }}">{{ r.state }}</span>
+          </td>
+          <td class="px-4 py-3 text-right tabular-nums {{ 'font-semibold text-amber-700' if r.attempt_count >= 3 else '' }}">{{ r.attempt_count }}</td>
+          <td class="px-4 py-3 text-right tabular-nums" data-chase-badge="{{ r.id }}">{{ r.chase_count }}</td>
+          <td class="whitespace-nowrap px-4 py-3 text-right tabular-nums
+              {% if r.is_open and age_band(age) == 'crit' %}font-semibold text-red-700{% elif r.is_open and age_band(age) == 'warn' %}font-medium text-amber-700{% else %}text-slate-600{% endif %}">
+            {{ age }}d
+          </td>
+          <td class="whitespace-nowrap px-4 py-3 text-right">
+            {% if r.state in chaseable_states and selected.status == 'Active' %}
+            <button type="button" data-chase="{{ r.id }}" data-ref="{{ r.ref }}" data-doc="{{ r.document }}" data-owner="{{ r.owner_person }}" data-age="{{ age }}"
+                    class="rounded-md border border-orange-300 bg-orange-50 px-2.5 py-1.5 text-xs font-semibold text-orange-900 hover:bg-orange-100">Chase</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="9" class="px-4 py-10 text-center text-slate-500">No requests in this engagement yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  </div>{# /ledger-panel #}
+
+  {# ---- The Outstanding Board (loaded on demand) ---- #}
+  <div id="board-panel" class="mt-5 hidden" data-engagement="{{ selected.id }}"></div>
+</section>
+{% endif %}
+
+{# ---------------- Audit trail drawer ---------------- #}
+<div id="drawer-overlay" class="fixed inset-0 z-30 hidden bg-slate-900/40"></div>
+<aside id="drawer" class="drawer fixed inset-y-0 right-0 z-40 w-full max-w-xl translate-x-full overflow-y-auto bg-white shadow-2xl" aria-hidden="true">
+  <div id="drawer-body"></div>
+</aside>
+
+{# ---------------- Requirement list builder + entity profile modals ---------------- #}
+<div id="req-modal" class="fixed inset-0 z-50 hidden items-start justify-center overflow-y-auto bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-label="Requirement list builder">
+  <div id="req-body" class="my-4 w-full max-w-5xl rounded-xl bg-white shadow-2xl"></div>
+</div>
+<div id="profile-modal" class="fixed inset-0 z-[60] hidden items-start justify-center overflow-y-auto bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-label="Entity profile">
+  <div id="profile-body" class="my-8 w-full max-w-3xl rounded-xl bg-white shadow-2xl"></div>
+</div>
+
+{# ---------------- New request modal ---------------- #}
+{% if selected and selected.status == 'Active' %}
+<div id="modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-xl bg-white shadow-2xl">
+    <div class="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+      <h3 id="modal-title" class="text-base font-semibold text-slate-900">New manual request</h3>
+      <button type="button" id="close-modal" class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
+        <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+      </button>
+    </div>
+    <form id="create-form" class="space-y-4 px-5 py-4">
+      <input type="hidden" name="engagement_id" value="{{ selected.id }}">
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="f-document">Document asked for *</label>
+        <input id="f-document" name="document" required maxlength="300" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="e.g. Bank statements - HDFC current account">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="f-owner">Named person on the client side *</label>
+        <input id="f-owner" name="owner_person" required maxlength="200" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="e.g. Ravi Menon (Accountant)">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="f-sig">Significance *</label>
+          <select id="f-sig" name="significance" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
+            <option value="Routine">Routine</option>
+            <option value="Material">Material to the opinion</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="f-prio">Priority</label>
+          <select id="f-prio" name="priority" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
+            <option value="1">1 - highest</option><option value="2">2</option><option value="3" selected>3</option>
+            <option value="4">4</option><option value="5">5 - lowest</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="f-from">Period from</label>
+          <input id="f-from" type="date" name="period_from" value="{{ selected.period_from.isoformat() if selected.period_from else '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600" for="f-to">Period to</label>
+          <input id="f-to" type="date" name="period_to" value="{{ selected.period_to.isoformat() if selected.period_to else '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="f-desc">Description (in the words the client will read)</label>
+        <textarea id="f-desc" name="description" rows="2" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"></textarea>
+      </div>
+
+      <div id="create-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></div>
+      <div id="duplicate-box" class="hidden rounded-md bg-amber-50 px-3 py-3 text-sm text-amber-900 ring-1 ring-amber-300">
+        <div class="font-semibold">Already requested - not created.</div>
+        <div id="duplicate-text" class="mt-1"></div>
+        <button type="button" id="open-existing" class="mt-2 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700">Open the existing request</button>
+      </div>
+
+      <div class="flex justify-end gap-2 border-t border-slate-100 pt-4">
+        <button type="button" id="cancel-modal" class="rounded-md border border-slate-300 px-3.5 py-2 text-sm text-slate-700 hover:bg-slate-100">Cancel</button>
+        <button type="submit" class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Create as Drafted</button>
+      </div>
+      <p class="text-xs text-slate-500">Creates the request and logs event #1 (Drafted). It is not visible to the client until it is marked Sent.</p>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+{# ---------------- Inline chase modal ---------------- #}
+<div id="chase-modal" class="fixed inset-0 z-[70] hidden items-center justify-center bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-labelledby="chase-title">
+  <div class="max-h-full w-full max-w-lg overflow-y-auto rounded-xl bg-white shadow-2xl">
+    <div class="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+      <div>
+        <h3 id="chase-title" class="text-base font-semibold text-slate-900">Record a chase</h3>
+        <p id="chase-context" class="mt-0.5 text-xs text-slate-500"></p>
+      </div>
+      <button type="button" data-close-chase class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
+        <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+      </button>
+    </div>
+    <form id="chase-form" class="space-y-4 px-5 py-4">
+      <fieldset>
+        <legend class="block text-xs font-medium text-slate-600">Chased by *</legend>
+        <div class="mt-1 grid grid-cols-3 gap-2">
+          {% for c in chase_channels %}
+          <label class="cursor-pointer">
+            <input type="radio" name="channel" value="{{ c }}" class="peer sr-only" {{ 'checked' if loop.first else '' }}>
+            <span class="block rounded-md border border-slate-300 bg-white px-3 py-2 text-center text-sm font-medium text-slate-700 peer-checked:border-slate-900 peer-checked:bg-slate-900 peer-checked:text-white peer-focus-visible:ring-2 peer-focus-visible:ring-sky-500">{{ c }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </fieldset>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="chase-template">Template</label>
+        <select id="chase-template" name="template" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
+          {% for t in chase_templates %}<option value="{{ t.key }}">{{ t.label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="chase-note">Message / note * <span class="font-normal text-slate-400">(edit freely - this is what the history will show)</span></label>
+        <textarea id="chase-note" name="note" rows="4" maxlength="1000" required class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm"></textarea>
+      </div>
+      <p id="chase-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+      <div class="flex items-center justify-between gap-3 border-t border-slate-100 pt-4">
+        <p class="text-xs text-slate-500">Appends a <b>Chased</b> event to the history and adds one to the chase count.</p>
+        <div class="flex shrink-0 gap-2">
+          <button type="button" data-close-chase class="rounded-md border border-slate-300 px-3.5 py-2 text-sm text-slate-700 hover:bg-slate-100">Cancel</button>
+          <button type="submit" id="chase-submit" class="rounded-md bg-orange-600 px-3.5 py-2 text-sm font-semibold text-white hover:bg-orange-700">Record chase</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+<script type="application/json" id="chase-templates">{{ chase_templates|tojson }}</script>
+<div id="toast" class="fixed bottom-5 left-1/2 z-[80] hidden -translate-x-1/2 rounded-lg bg-slate-900 px-4 py-3 text-sm text-white shadow-xl" role="status"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const drawer = document.getElementById('drawer');
+  const overlay = document.getElementById('drawer-overlay');
+  const body = document.getElementById('drawer-body');
+  let dirty = false;
+  let currentId = null;
+
+  async function readJson(res) {
+    try { return await res.json(); } catch (e) { return { error: 'Unexpected response from the server.' }; }
+  }
+
+  // ---------- Drawer ----------
+  async function loadDrawer(id, flash) {
+    const res = await fetch(`/requests/${id}/trail`);
+    if (!res.ok) {
+      const data = await readJson(res);
+      body.innerHTML = `<p class="p-5 text-sm text-rose-700">${(data.error || 'Could not load this request.')}</p>`;
+      return;
+    }
+    body.innerHTML = await res.text();
+    syncFields();
+    if (flash) flashMessage(flash);
+  }
+  function openDrawer(id) {
+    currentId = id;
+    body.innerHTML = '<p class="p-5 text-sm text-slate-500">Loading...</p>';
+    drawer.classList.remove('translate-x-full');
+    drawer.setAttribute('aria-hidden', 'false');
+    overlay.classList.remove('hidden');
+    loadDrawer(id);
+  }
+  function closeDrawer() {
+    drawer.classList.add('translate-x-full');
+    drawer.setAttribute('aria-hidden', 'true');
+    overlay.classList.add('hidden');
+    if (dirty) { location.reload(); }
+  }
+  overlay.addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (modal && !modal.classList.contains('hidden')) { closeModal(); } else if (currentId !== null) { closeDrawer(); currentId = null; }
+    }
+  });
+  document.querySelectorAll('.request-row').forEach((row) => {
+    const open = () => openDrawer(row.dataset.id);
+    row.addEventListener('click', (e) => { if (e.target.closest('[data-chase]')) return; open(); });
+    row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+
+  // ---------- Event form inside the drawer ----------
+  function syncFields() {
+    const form = document.getElementById('event-form');
+    if (!form) return;
+    const type = form.querySelector('[name=event_type]').value;
+    form.querySelectorAll('[data-fields]').forEach((box) => {
+      const show = box.dataset.fields.split(',').includes(type);
+      box.classList.toggle('hidden', !show);
+      box.querySelectorAll('input, select, textarea').forEach((el) => { el.disabled = !show; });
+    });
+  }
+  body.addEventListener('change', (e) => { if (e.target && e.target.id === 'ev-type') syncFields(); });
+  body.addEventListener('click', (e) => { if (e.target.closest('[data-close-drawer]')) { closeDrawer(); currentId = null; } });
+  body.addEventListener('submit', async (e) => {
+    if (e.target.id !== 'event-form') return;
+    e.preventDefault();
+    const form = e.target;
+    const err = document.getElementById('event-error');
+    err.classList.add('hidden');
+    const actor = currentActor();
+    if (!actor) { err.textContent = "Enter your name in 'Acting as' (top right) first."; err.classList.remove('hidden'); return; }
+    const fd = new FormData(form);
+    fd.set('actor', actor);
+    const res = await fetch(`/requests/${form.dataset.requestId}/events`, { method: 'POST', body: fd });
+    const data = await readJson(res);
+    if (!res.ok) { err.textContent = data.error || 'Could not record the event.'; err.classList.remove('hidden'); return; }
+    dirty = true;
+    loadDrawer(form.dataset.requestId);
+  });
+
+  // ---------- Filters ----------
+  const chips = document.querySelectorAll('.filter-chip');
+  function applyFilter(key) {
+    chips.forEach((c) => {
+      const on = c.dataset.filter === key;
+      c.classList.toggle('bg-slate-900', on); c.classList.toggle('text-white', on); c.classList.toggle('border-slate-900', on);
+      c.classList.toggle('bg-white', !on); c.classList.toggle('text-slate-700', !on);
+    });
+    document.querySelectorAll('.request-row').forEach((row) => {
+      const pinned = row.dataset.pinned === '1';
+      const isOpen = row.dataset.open === '1';
+      const show = pinned || key === 'all' || (key === 'open' && isOpen) || (key === 'done' && !isOpen);
+      row.classList.toggle('hidden', !show);
+    });
+  }
+  chips.forEach((c) => c.addEventListener('click', () => applyFilter(c.dataset.filter)));
+  if (chips.length) applyFilter('all');
+
+  // ---------- New request modal ----------
+  const modal = document.getElementById('modal');
+  const form = document.getElementById('create-form');
+  let existingId = null;
+  function openModal() { if (!modal) return; modal.classList.remove('hidden'); modal.classList.add('flex'); document.getElementById('f-document').focus(); }
+  function closeModal() { if (!modal) return; modal.classList.add('hidden'); modal.classList.remove('flex'); }
+  const openBtn = document.getElementById('open-modal');
+  if (openBtn) openBtn.addEventListener('click', openModal);
+  if (modal) {
+    document.getElementById('close-modal').addEventListener('click', closeModal);
+    document.getElementById('cancel-modal').addEventListener('click', closeModal);
+    document.getElementById('open-existing').addEventListener('click', () => { closeModal(); if (existingId) openDrawer(existingId); });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('create-error');
+      const dup = document.getElementById('duplicate-box');
+      err.classList.add('hidden'); dup.classList.add('hidden');
+      const actor = currentActor();
+      if (!actor) { err.textContent = "Enter your name in 'Acting as' (top right) first."; err.classList.remove('hidden'); return; }
+      const fd = new FormData(form);
+      fd.set('actor', actor);
+      const res = await fetch('/requests', { method: 'POST', body: fd });
+      const data = await readJson(res);
+      if (res.ok) { location.reload(); return; }
+      if (res.status === 409 && data.existing) {
+        existingId = data.existing.id;
+        document.getElementById('duplicate-text').textContent =
+          `${data.existing.ref} - ${data.existing.document} is ${data.existing.state}, owned by ${data.existing.owner_person}.`;
+        dup.classList.remove('hidden');
+        return;
+      }
+      err.textContent = data.error || 'Could not create the request.';
+      err.classList.remove('hidden');
+    });
+  }
+
+  // ---------- Requirement list builder (Stage 2) ----------
+  const reqModal = document.getElementById('req-modal');
+  const reqBody = document.getElementById('req-body');
+  const profModal = document.getElementById('profile-modal');
+  const profBody = document.getElementById('profile-body');
+  let reqEngagement = null, reqType = null, generated = false, reqCarry = false;
+  const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const show = (m) => { m.classList.remove('hidden'); m.classList.add('flex'); };
+  const hide = (m) => { m.classList.add('hidden'); m.classList.remove('flex'); };
+
+  async function loadRequirements(engagement, type, keep) {
+    reqEngagement = engagement;
+    const ownerInput = document.getElementById('default-owner');
+    const owner = keep && ownerInput ? ownerInput.value : '';
+    show(reqModal);
+    if (!keep) reqBody.innerHTML = '<p class="p-6 text-sm text-slate-500">Loading...</p>';
+    const qs = new URLSearchParams();
+    if (type) qs.set('type', type);
+    if (reqCarry) qs.set('carry', '1');
+    const res = await fetch(`/engagements/${engagement}/requirements` + (qs.toString() ? `?${qs}` : ''));
+    if (!res.ok) {
+      const d = await readJson(res);
+      reqBody.innerHTML = `<p class="p-6 text-sm text-rose-700">${esc(d.error || 'Could not load the builder.')}</p>`;
+      return;
+    }
+    reqBody.innerHTML = await res.text();
+    reqType = reqBody.querySelector('#gen-form').dataset.type;
+    if (owner) document.getElementById('default-owner').value = owner;
+  }
+  function closeRequirements() { hide(reqModal); if (generated) location.reload(); }
+
+  const openReq = document.getElementById('open-requirements');
+  if (openReq) openReq.addEventListener('click', () => { reqCarry = false; loadRequirements(openReq.dataset.engagement, null, false); });
+
+  reqBody.addEventListener('change', (e) => {
+    if (e.target.id === 'tpl-select') loadRequirements(reqEngagement, e.target.value, true);
+    if (e.target.id === 'carry-toggle') { reqCarry = e.target.checked; loadRequirements(reqEngagement, reqType, true); }
+    if (e.target.id === 'check-all') reqBody.querySelectorAll('.row-check').forEach((c) => { c.checked = e.target.checked; });
+  });
+  reqBody.addEventListener('click', (e) => {
+    if (e.target.closest('[data-close-req]')) closeRequirements();
+    if (e.target.id === 'edit-profile') openProfile(reqEngagement, reqType);
+    if (e.target.id === 'gen-done') closeRequirements();
+  });
+  reqBody.addEventListener('submit', async (e) => {
+    if (e.target.id !== 'gen-form') return;
+    e.preventDefault();
+    const form = e.target;
+    const err = document.getElementById('gen-error');
+    err.classList.add('hidden');
+    const actor = currentActor();
+    if (!actor) { err.textContent = "Enter your name in 'Acting as' (top right) first."; err.classList.remove('hidden'); return; }
+    const fd = new FormData(form);
+    fd.set('actor', actor);
+    const btn = document.getElementById('gen-submit');
+    btn.disabled = true;
+    const res = await fetch(`/engagements/${form.dataset.engagement}/requirements/generate`, { method: 'POST', body: fd });
+    const d = await readJson(res);
+    btn.disabled = false;
+    if (!res.ok) { err.textContent = d.error || 'Could not generate the requests.'; err.classList.remove('hidden'); return; }
+    generated = true;
+    const li = (items, fn) => items.length ? `<ul class="mt-1 list-disc pl-5 text-sm">${items.map((x) => `<li>${fn(x)}</li>`).join('')}</ul>` : '';
+    const box = document.getElementById('gen-result');
+    box.innerHTML =
+      `<div class="rounded-md bg-emerald-50 px-4 py-3 text-sm text-emerald-900 ring-1 ring-emerald-200">` +
+      `<div class="font-semibold">${d.created.length} request${d.created.length === 1 ? '' : 's'} created as Drafted.</div>` +
+      li(d.created, (c) => `${esc(c.ref)} - ${esc(c.document)}${c.carry_tag ? ' <span class="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-900">' + esc(c.carry_tag) + '</span>' : ''}`) +
+      (d.existing.length ? `<div class="mt-2 font-semibold text-amber-900">Skipped - already held (${d.existing.length})</div>` +
+        li(d.existing, (x) => `${esc(x.document)}: ${esc(x.reason)} - ${esc(x.ref)} (${esc(x.state)}), held by ${esc(x.owner_person)}`) : '') +
+      (d.suppressed.length ? `<div class="mt-2 font-semibold text-slate-800">Suppressed by the entity profile (${d.suppressed.length}; ${d.new_suppressions} newly recorded)</div>` +
+        li(d.suppressed, (x) => `${esc(x.document)}: ${esc(x.basis)}`) : '') +
+      (d.deselected.length ? `<div class="mt-2 text-slate-700">${d.deselected.length} unticked item(s) left out.</div>` : '') +
+      `<button type="button" id="gen-done" class="mt-3 rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Done - back to the ledger</button></div>`;
+    box.classList.remove('hidden');
+    btn.classList.add('hidden');
+    box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+
+  // ---------- Entity profile editor ----------
+  async function openProfile(engagement, type) {
+    show(profModal);
+    profBody.innerHTML = '<p class="p-6 text-sm text-slate-500">Loading...</p>';
+    const res = await fetch(`/engagements/${engagement}/profile` + (type ? `?type=${encodeURIComponent(type)}` : ''));
+    profBody.innerHTML = await res.text();
+  }
+  const openProf = document.getElementById('open-profile');
+  if (openProf) openProf.addEventListener('click', () => openProfile(openProf.dataset.engagement, null));
+  let impactTimer = null;
+  profBody.addEventListener('change', (e) => {
+    const form = e.target.closest('#profile-form');
+    if (!form) return;
+    clearTimeout(impactTimer);
+    impactTimer = setTimeout(async () => {
+      const q = new URLSearchParams(new FormData(form)).toString();
+      const res = await fetch(`/engagements/${form.dataset.engagement}/profile/impact?${q}`);
+      if (res.ok) document.getElementById('profile-impact').innerHTML = await res.text();
+    }, 150);
+  });
+  profBody.addEventListener('click', (e) => { if (e.target.closest('[data-close-profile]')) hide(profModal); });
+  profBody.addEventListener('submit', async (e) => {
+    if (e.target.id !== 'profile-form') return;
+    e.preventDefault();
+    const form = e.target;
+    const err = document.getElementById('profile-error');
+    err.classList.add('hidden');
+    const res = await fetch(`/engagements/${form.dataset.engagement}/profile`, { method: 'POST', body: new FormData(form) });
+    const d = await readJson(res);
+    if (!res.ok) { err.textContent = d.error || 'Could not save the profile.'; err.classList.remove('hidden'); return; }
+    hide(profModal);
+    if (!reqModal.classList.contains('hidden')) loadRequirements(reqEngagement, reqType, true);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!profModal.classList.contains('hidden')) hide(profModal);
+    else if (!reqModal.classList.contains('hidden')) closeRequirements();
+  });
+
+  // ---------- Stage 3: submissions and review (inside the drawer) ----------
+  function flashMessage(html) {
+    const box = document.getElementById('drawer-flash');
+    if (box) { box.innerHTML = html; box.classList.remove('hidden'); }
+  }
+  async function postForm(url, fd) {
+    const res = await fetch(url, { method: 'POST', body: fd });
+    const data = await readJson(res);
+    return { ok: res.ok, data };
+  }
+  function needActor(errEl) {
+    const actor = currentActor();
+    if (!actor) {
+      errEl.textContent = "Enter your name in 'Acting as' (top right) first.";
+      errEl.classList.remove('hidden');
+      return null;
+    }
+    return actor;
+  }
+
+  body.addEventListener('submit', async (e) => {
+    if (e.target.id !== 'submit-form') return;
+    e.preventDefault();
+    const form = e.target;
+    const err = document.getElementById('submit-error');
+    err.classList.add('hidden');
+    const actor = needActor(err);
+    if (!actor) return;
+    const fd = new FormData(form);
+    fd.set('actor', actor);
+    const { ok, data } = await postForm(`/requests/${form.dataset.requestId}/submissions`, fd);
+    if (!ok) { err.textContent = data.error || 'Could not record the submission.'; err.classList.remove('hidden'); return; }
+    dirty = true;
+    const parts = [];
+    if (data.new_files.length) parts.push(`<b>${data.new_files.length}</b> new file(s) stored as one submission and sent for review.`);
+    data.arrivals.forEach((a) => parts.push(`<b>${esc(a.filename)}</b>: identical content arrived again (now arrived ${a.count} times) - recorded as an arrival, not a new file.`));
+    await loadDrawer(form.dataset.requestId, parts.join('<br>'));
+  });
+
+  body.addEventListener('click', async (e) => {
+    const panel = e.target.closest('#review-panel');
+    if (!panel) return;
+    const err = document.getElementById('review-error');
+    const note = document.getElementById('review-note').value;
+    const reqId = panel.dataset.request;
+    err.classList.add('hidden');
+
+    if (e.target.id === 'start-review') {
+      const actor = needActor(err); if (!actor) return;
+      const fd = new FormData(); fd.set('event_type', 'UNDER_REVIEW'); fd.set('actor', actor); if (note) fd.set('note', note);
+      const { ok, data } = await postForm(`/requests/${reqId}/events`, fd);
+      if (!ok) { err.textContent = data.error || 'Could not start the review.'; err.classList.remove('hidden'); return; }
+      dirty = true; await loadDrawer(reqId, 'Review started.');
+    }
+    if (e.target.id === 'accept-doc') {
+      const actor = needActor(err); if (!actor) return;
+      if (!confirm('Accept this document?\n\nIt becomes available to file as evidence and the request is closed as Accepted.')) return;
+      const fd = new FormData(); fd.set('action', 'accept'); fd.set('actor', actor); fd.set('note', note);
+      const { ok, data } = await postForm(`/submissions/${panel.dataset.submission}/review`, fd);
+      if (!ok) { err.textContent = data.error || 'Could not accept.'; err.classList.remove('hidden'); return; }
+      dirty = true; await loadDrawer(reqId, 'Document accepted.');
+    }
+    if (e.target.id === 'reject-doc') document.getElementById('reject-box').classList.remove('hidden');
+    if (e.target.id === 'cancel-reject') document.getElementById('reject-box').classList.add('hidden');
+    if (e.target.id === 'confirm-reject') {
+      const sel = document.getElementById('reject-code');
+      if (!sel.value) { err.textContent = 'Choose one of the eight reason codes.'; err.classList.remove('hidden'); return; }
+      const actor = needActor(err); if (!actor) return;
+      const label = sel.options[sel.selectedIndex].text;
+      const msg = sel.options[sel.selectedIndex].dataset.message;
+      if (!confirm(`Reject this document as "${label}"?\n\nThe client will be told: ${msg}\n\nThe document is re-requested immediately.`)) return;
+      const fd = new FormData(); fd.set('action', 'reject'); fd.set('actor', actor); fd.set('reason_code', sel.value); fd.set('note', note);
+      const { ok, data } = await postForm(`/submissions/${panel.dataset.submission}/review`, fd);
+      if (!ok) { err.textContent = data.error || 'Could not reject.'; err.classList.remove('hidden'); return; }
+      dirty = true; await loadDrawer(reqId, `Rejected as <b>${esc(label)}</b> and re-requested.`);
+    }
+  });
+  body.addEventListener('change', (e) => {
+    if (e.target.id !== 'reject-code') return;
+    const box = document.getElementById('reject-explainer');
+    const msg = e.target.value ? e.target.options[e.target.selectedIndex].dataset.message : '';
+    box.textContent = msg ? `Client will be told: ${msg}` : '';
+    box.classList.toggle('hidden', !msg);
+  });
+
+
+
+  // ---------- Stage 4: Outstanding Board, inline chase, export ----------
+  const toast = document.getElementById('toast');
+  let toastTimer = null;
+  function showToast(html) {
+    toast.innerHTML = html;
+    toast.classList.remove('hidden');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.add('hidden'), 4200);
+  }
+
+  // -- Ledger / Board views
+  const ledgerPanel = document.getElementById('ledger-panel');
+  const boardPanel = document.getElementById('board-panel');
+  const viewTabs = document.querySelectorAll('.view-tab');
+  let boardCut = 'age';
+
+  function applyBoardSearch() {
+    const input = document.getElementById('board-search');
+    if (!input) return;
+    const q = input.value.trim().toLowerCase();
+    let hidden = 0;
+    boardPanel.querySelectorAll('.board-row').forEach((row) => {
+      // A Material request is never filtered away.
+      const keep = !q || row.dataset.material === '1' || row.dataset.search.includes(q);
+      row.classList.toggle('hidden', !keep);
+      if (!keep) hidden += 1;
+    });
+    const note = document.getElementById('board-hidden');
+    note.textContent = hidden ? `${hidden} hidden - Material always shown` : '';
+    note.classList.toggle('hidden', !hidden);
+  }
+  async function loadBoard(cut) {
+    if (!boardPanel) return;
+    if (cut) boardCut = cut;
+    const prev = document.getElementById('board-search');
+    const q = prev ? prev.value : '';
+    const res = await fetch(`/engagements/${boardPanel.dataset.engagement}/board?cut=${encodeURIComponent(boardCut)}`);
+    if (!res.ok) {
+      const d = await readJson(res);
+      boardPanel.innerHTML = `<p class="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800">${esc(d.error || 'Could not load the board.')}</p>`;
+      return;
+    }
+    boardPanel.innerHTML = await res.text();
+    const input = document.getElementById('board-search');
+    if (input && q) input.value = q;
+    applyBoardSearch();
+  }
+  function showView(view) {
+    if (!boardPanel) return;
+    const board = view === 'board';
+    ledgerPanel.classList.toggle('hidden', board);
+    boardPanel.classList.toggle('hidden', !board);
+    viewTabs.forEach((t) => {
+      const on = t.dataset.view === view;
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      t.classList.toggle('bg-slate-900', on); t.classList.toggle('text-white', on);
+      t.classList.toggle('text-slate-700', !on); t.classList.toggle('hover:bg-slate-100', !on);
+    });
+    try { history.replaceState(null, '', board ? `#board/${boardCut}` : location.pathname + location.search); } catch (e) {}
+    if (board) loadBoard();
+  }
+  viewTabs.forEach((t) => t.addEventListener('click', () => showView(t.dataset.view)));
+  if (boardPanel) {
+    boardPanel.addEventListener('click', (e) => {
+      const cutBtn = e.target.closest('.cut-tab');
+      if (cutBtn) { loadBoard(cutBtn.dataset.cut).then(() => { try { history.replaceState(null, '', `#board/${boardCut}`); } catch (x) {} }); return; }
+      if (e.target.closest('[data-chase],a,input')) return;
+      const row = e.target.closest('.board-row');
+      if (row) openDrawer(row.dataset.id);
+    });
+    boardPanel.addEventListener('keydown', (e) => {
+      const row = e.target.closest && e.target.closest('.board-row');
+      if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openDrawer(row.dataset.id); }
+    });
+    boardPanel.addEventListener('input', (e) => { if (e.target.id === 'board-search') applyBoardSearch(); });
+    const m = location.hash.match(/^#board(?:\/(\w+))?/);
+    if (m) { if (m[1]) boardCut = m[1]; showView('board'); }
+  }
+
+  // -- Export links carry the name of whoever prints the thread
+  document.addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-export]');
+    if (!a) return;
+    if (!a.dataset.base) a.dataset.base = a.getAttribute('href').split('?')[0];
+    const who = currentActor();
+    a.href = a.dataset.base + (who ? `?by=${encodeURIComponent(who)}` : '');
+  });
+
+  // -- Inline chase (from a board row, a ledger row or the drawer)
+  const chaseModal = document.getElementById('chase-modal');
+  const chaseForm = document.getElementById('chase-form');
+  const chaseTpls = JSON.parse(document.getElementById('chase-templates').textContent);
+  const chaseSelect = document.getElementById('chase-template');
+  const chaseNote = document.getElementById('chase-note');
+  const chaseErr = document.getElementById('chase-error');
+  let chaseCtx = null;
+
+  function renderChase(text, ctx) {
+    const name = (ctx.owner || '').split('(')[0].trim();
+    return text.replace('{first_name}', name.split(/\s+/)[0] || name).replace('{owner}', name)
+      .replace('{document}', ctx.doc).replace('{ref}', ctx.ref).replace('{age}', ctx.age);
+  }
+  function fillChaseNote() {
+    const t = chaseTpls.find((x) => x.key === chaseSelect.value);
+    chaseNote.value = t ? renderChase(t.text, chaseCtx) : '';
+  }
+  function openChase(ds) {
+    chaseCtx = { id: ds.chase, ref: ds.ref, doc: ds.doc, owner: ds.owner, age: ds.age };
+    document.getElementById('chase-context').textContent = `${ds.ref} - ${ds.doc} (held by ${(ds.owner || '').split('(')[0].trim()}, ${ds.age} days outstanding)`;
+    chaseErr.classList.add('hidden');
+    chaseSelect.value = chaseTpls[0].key;
+    fillChaseNote();
+    show(chaseModal);
+    chaseNote.focus();
+  }
+  function closeChase() { hide(chaseModal); chaseCtx = null; }
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-chase]');
+    if (btn) { e.preventDefault(); openChase(btn.dataset); }
+    if (e.target.closest('[data-close-chase]')) closeChase();
+  });
+  chaseSelect.addEventListener('change', () => { fillChaseNote(); if (chaseSelect.value === 'custom') chaseNote.focus(); });
+  // Closes the chase dialog first, before the drawer or other dialogs see Escape.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !chaseModal.classList.contains('hidden')) { closeChase(); e.stopImmediatePropagation(); }
+  }, true);
+
+  chaseForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    chaseErr.classList.add('hidden');
+    const actor = currentActor();
+    if (!actor) { chaseErr.textContent = "Enter your name in 'Acting as' (top right) first."; chaseErr.classList.remove('hidden'); return; }
+    const fd = new FormData(chaseForm);
+    fd.set('actor', actor);
+    const btn = document.getElementById('chase-submit');
+    btn.disabled = true;
+    const { ok, data } = await postForm(`/requests/${chaseCtx.id}/chase`, fd);
+    btn.disabled = false;
+    if (!ok) { chaseErr.textContent = data.error || 'Could not record the chase.'; chaseErr.classList.remove('hidden'); return; }
+    const id = chaseCtx.id, ref = chaseCtx.ref;
+    closeChase();
+    dirty = true;
+    // The badge moves at once; the board re-sorts a moment later.
+    document.querySelectorAll(`[data-chase-badge="${id}"]`).forEach((el) => {
+      el.textContent = el.closest('#board-panel') ? `${data.chase_count}×` : String(data.chase_count);
+      el.classList.add('ring-2', 'ring-orange-400');
+    });
+    showToast(`Chase recorded on <b>${esc(ref)}</b> - now chased ${data.chase_count} time${data.chase_count === 1 ? '' : 's'}.`);
+    if (currentId !== null && String(currentId) === String(id)) loadDrawer(id);
+    if (boardPanel && !boardPanel.classList.contains('hidden')) setTimeout(() => loadBoard(), 900);
+  });
+
+  // ---------- Close-out ----------
+  const closeBtn = document.getElementById('close-engagement');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', async () => {
+      const actor = currentActor();
+      if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+      if (!confirm('Close out this engagement?\n\nEvery request still open will be FROZEN as "Unfulfilled at report date". ' +
+                   'They are not deleted and not waived. This cannot be undone.')) return;
+      const fd = new FormData();
+      fd.set('actor', actor);
+      const res = await fetch(`/engagements/${closeBtn.dataset.engagement}/close`, { method: 'POST', body: fd });
+      const data = await readJson(res);
+      if (!res.ok) { alert(data.error || 'Could not close the engagement.'); return; }
+      location.reload();
+    });
+  }
+})();
+</script>
+{% endblock %}

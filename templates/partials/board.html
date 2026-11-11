@@ -1,0 +1,165 @@
+{# The Outstanding Board: what the client still owes, cut four ways. Rendered as a partial and
+   injected into the dashboard, so the audit-trail drawer and the chase modal work from every row. #}
+{% set s = b.summary %}
+
+{% macro age_badge(row) -%}
+  {% if row.band == 'crit' %}
+    <span class="inline-flex items-center gap-1 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-semibold text-white" title="More than {{ age_crit }} days outstanding - escalate">{{ row.age }}d<span class="text-[10px] font-medium uppercase tracking-wide opacity-90">escalate</span></span>
+  {% elif row.band == 'warn' %}
+    <span class="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-inset ring-amber-300" title="More than {{ age_warn }} days outstanding">{{ row.age }}d</span>
+  {% else %}
+    <span class="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-200">{{ row.age }}d</span>
+  {% endif %}
+{%- endmacro %}
+
+{% macro chase_badge(row) -%}
+  <span data-chase-badge="{{ row.id }}" class="inline-flex min-w-[2rem] items-center justify-center rounded-full px-2 py-0.5 text-xs font-semibold tabular-nums
+    {% if row.chase_count >= 3 %}bg-orange-600 text-white{% elif row.chase_count >= 1 %}bg-orange-100 text-orange-900 ring-1 ring-inset ring-orange-300{% else %}bg-slate-100 text-slate-500 ring-1 ring-inset ring-slate-200{% endif %}"
+    title="{{ row.chase_count }} chase{{ '' if row.chase_count == 1 else 's' }} recorded">{{ row.chase_count }}&times;</span>
+{%- endmacro %}
+
+{% macro board_table(rows, show_owner=True) -%}
+<div class="overflow-x-auto">
+  <table class="min-w-full divide-y divide-slate-200 text-sm">
+    <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+      <tr>
+        <th class="px-4 py-2.5 font-medium">Document</th>
+        {% if show_owner %}<th class="px-4 py-2.5 font-medium">Client owner</th>{% endif %}
+        <th class="px-4 py-2.5 font-medium">Status</th>
+        <th class="px-4 py-2.5 text-right font-medium">Age</th>
+        <th class="px-4 py-2.5 font-medium">Chases</th>
+        <th class="px-4 py-2.5 text-right font-medium"><span class="sr-only">Actions</span></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-100">
+      {% for row in rows %}
+      <tr class="board-row cursor-pointer hover:bg-slate-50 {{ 'bg-rose-50/50' if row.material else '' }}"
+          data-id="{{ row.id }}" data-material="{{ 1 if row.material else 0 }}"
+          data-search="{{ (row.ref ~ ' ' ~ row.document ~ ' ' ~ row.owner)|lower }}"
+          tabindex="0" role="button" aria-label="Open audit trail for {{ row.ref }}">
+        <td class="px-4 py-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-mono text-xs text-slate-500">{{ row.ref }}</span>
+            {% if row.material %}<span class="rounded-full bg-rose-600 px-2 py-0.5 text-[11px] font-semibold text-white">Material</span>{% endif %}
+            {% if row.attempts >= 2 %}<span class="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 ring-1 ring-inset ring-amber-300">Attempt {{ row.attempts }}</span>{% endif %}
+          </div>
+          <div class="font-medium text-slate-900">{{ row.document }}</div>
+          <div class="text-xs text-slate-500">{{ period_text(row.req) }}</div>
+        </td>
+        {% if show_owner %}
+        <td class="px-4 py-3 text-slate-700">{{ row.owner_name }}{% if row.owner_role %}<div class="text-xs text-slate-500">{{ row.owner_role }}</div>{% endif %}</td>
+        {% endif %}
+        <td class="whitespace-nowrap px-4 py-3">
+          <span class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset {{ state_style(row.state) }}">{{ row.state }}</span>
+        </td>
+        <td class="whitespace-nowrap px-4 py-3 text-right">{{ age_badge(row) }}</td>
+        <td class="px-4 py-3">
+          {{ chase_badge(row) }}
+          <div class="mt-0.5 text-[11px] leading-tight text-slate-500" data-chase-meta="{{ row.id }}">
+            {% if row.last_chase %}last {{ 'today' if row.last_chase_days == 0 else row.last_chase_days ~ 'd ago' }} · {{ row.last_chase.channel }}{% if row.silent_chases >= 2 %}<br><b class="text-orange-700">{{ row.silent_chases }} with nothing arriving</b>{% endif %}{% else %}never chased{% endif %}
+          </div>
+        </td>
+        <td class="whitespace-nowrap px-4 py-3 text-right">
+          {% if row.can_chase %}
+          <button type="button" data-chase="{{ row.id }}" data-ref="{{ row.ref }}" data-doc="{{ row.document }}"
+                  data-owner="{{ row.owner }}" data-age="{{ row.age }}"
+                  class="rounded-md border border-orange-300 bg-orange-50 px-2.5 py-1.5 text-xs font-semibold text-orange-900 hover:bg-orange-100">Chase</button>
+          {% endif %}
+          <a href="/engagements/{{ b.engagement.id }}/requests/{{ row.ref }}/export" target="_blank" rel="noopener" data-export
+             class="ml-1 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100">Export</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{%- endmacro %}
+
+{# ---- summary ---- #}
+<div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+  {% for label, value, tone in [
+    ('Outstanding with client', s.outstanding, 'text-slate-900'),
+    ('Material', s.material, 'text-rose-700'),
+    ('Over ' ~ age_warn ~ ' days', s.warn + s.crit, 'text-amber-700'),
+    ('Over ' ~ age_crit ~ ' days', s.crit, 'text-red-700'),
+    ('Chased 3+ times', s.chased_3plus, 'text-orange-700'),
+    ('Client owners', s.owners, 'text-slate-900'),
+  ] %}
+  <div class="rounded-lg border border-slate-200 bg-white px-4 py-3">
+    <div class="text-2xl font-semibold {{ tone }}">{{ value }}</div>
+    <div class="text-xs text-slate-500">{{ label }}</div>
+  </div>
+  {% endfor %}
+</div>
+{% if s.with_audit_team or s.not_sent %}
+<p class="mt-2 text-xs text-slate-500">Not on this board:
+  {% if s.with_audit_team %}<b>{{ s.with_audit_team }}</b> submitted and waiting on the audit team{% endif %}{% if s.with_audit_team and s.not_sent %}, {% endif %}{% if s.not_sent %}<b>{{ s.not_sent }}</b> drafted but not yet sent{% endif %}.</p>
+{% endif %}
+
+{# ---- cuts + search ---- #}
+<div class="mt-4 flex flex-wrap items-center justify-between gap-3">
+  <div class="inline-flex overflow-hidden rounded-lg border border-slate-300 bg-white text-sm shadow-sm" role="tablist" aria-label="Board cut">
+    {% for key, label in b.cuts %}
+      <button type="button" role="tab" data-cut="{{ key }}" aria-selected="{{ 'true' if key == b.cut else 'false' }}"
+              class="cut-tab px-3.5 py-2 font-medium {{ 'bg-slate-900 text-white' if key == b.cut else 'text-slate-700 hover:bg-slate-100' }}">{{ label }}</button>
+    {% endfor %}
+  </div>
+  <div class="flex items-center gap-2">
+    <label class="sr-only" for="board-search">Filter the board</label>
+    <input id="board-search" type="search" placeholder="Filter by document, owner or ref"
+           class="w-64 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
+    <span id="board-hidden" class="hidden text-xs text-slate-500"></span>
+  </div>
+</div>
+<p class="mt-2 text-xs text-slate-500">
+  {% if b.cut == 'age' %}Longest outstanding first. Amber past {{ age_warn }} days, red past {{ age_crit }} (escalate).
+  {% elif b.cut == 'owner' %}Grouped by the named person on the client side - who is sitting on how much.
+  {% elif b.cut == 'significance' %}Material-to-the-opinion requests are pinned above everything else and are never hidden by the filter.
+  {% else %}Most-chased first - requests chased repeatedly with nothing arriving rise to the top.{% endif %}
+  The filter never hides a Material request.
+</p>
+
+{# ---- the cut ---- #}
+<div class="mt-3 space-y-4">
+  {% if not b.rows %}
+    <div class="rounded-lg border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">
+      Nothing is outstanding with the client. Requests appear here once they are Sent and until they are Submitted.
+    </div>
+
+  {% elif b.cut == 'owner' %}
+    {% for g in b.groups %}
+    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+      <header class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
+        <div>
+          <div class="font-semibold text-slate-900">{{ g.name }}{% if g.role %} <span class="font-normal text-slate-500">· {{ g.role }}</span>{% endif %}</div>
+          <div class="text-xs text-slate-500">sitting on <b class="text-slate-900">{{ g.rows|length }}</b> request{{ '' if g.rows|length == 1 else 's' }}</div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          {% if g.material %}<span class="rounded-full bg-rose-600 px-2 py-0.5 font-semibold text-white">{{ g.material }} material</span>{% endif %}
+          <span class="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-900 ring-1 ring-inset ring-orange-300">{{ g.chases }} chase{{ '' if g.chases == 1 else 's' }}</span>
+          <span class="rounded-full px-2 py-0.5 font-medium ring-1 ring-inset {{ 'bg-red-100 text-red-800 ring-red-300' if g.band == 'crit' else ('bg-amber-100 text-amber-900 ring-amber-300' if g.band == 'warn' else 'bg-slate-100 text-slate-700 ring-slate-200') }}">oldest {{ g.oldest }}d</span>
+        </div>
+      </header>
+      {{ board_table(g.rows, show_owner=False) }}
+    </section>
+    {% endfor %}
+
+  {% elif b.cut == 'significance' %}
+    <section class="overflow-hidden rounded-lg border-2 border-rose-300 bg-white shadow-sm">
+      <header class="flex items-center justify-between gap-2 border-b border-rose-200 bg-rose-50 px-4 py-3">
+        <div class="font-semibold text-rose-950">Material to the opinion <span class="ml-1 rounded-full bg-rose-600 px-2 py-0.5 text-xs font-semibold text-white">{{ b.material_rows|length }}</span></div>
+        <span class="text-xs font-medium text-rose-800">Pinned - cannot be hidden or filtered away</span>
+      </header>
+      {% if b.material_rows %}{{ board_table(b.material_rows) }}{% else %}<p class="px-4 py-5 text-sm text-slate-500">No material request is outstanding.</p>{% endif %}
+    </section>
+    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+      <header class="border-b border-slate-200 bg-slate-50 px-4 py-3 font-semibold text-slate-900">Routine <span class="ml-1 rounded-full bg-slate-200 px-2 py-0.5 text-xs font-medium text-slate-700">{{ b.routine_rows|length }}</span></header>
+      {% if b.routine_rows %}{{ board_table(b.routine_rows) }}{% else %}<p class="px-4 py-5 text-sm text-slate-500">No routine request is outstanding.</p>{% endif %}
+    </section>
+
+  {% else %}
+    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+      {{ board_table(b.rows) }}
+    </section>
+  {% endif %}
+</div>

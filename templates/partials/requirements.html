@@ -1,0 +1,186 @@
+{# Requirement-list builder: choose a template, preview, release into the ledger. #}
+<div class="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+  <div>
+    <h3 class="text-base font-semibold text-slate-900">Requirement list builder</h3>
+    <p class="text-xs text-slate-500">{{ eng.name }} · {{ plan.template.title }} · v{{ plan.template.version }}</p>
+  </div>
+  <button type="button" data-close-req class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
+    <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+  </button>
+</div>
+
+<form id="gen-form" data-engagement="{{ eng.id }}" data-type="{{ chosen }}">
+  <input type="hidden" name="type" value="{{ chosen }}">
+  <input type="hidden" name="carry_forward" value="{{ 1 if plan.carry_forward else 0 }}">
+
+  {# ---- Carry forward from the prior year ---- #}
+  {% if prior %}
+  <div class="flex flex-wrap items-center justify-between gap-3 border-b border-sky-200 bg-sky-50 px-5 py-3">
+    <label class="flex cursor-pointer items-start gap-3 text-sm">
+      <input id="carry-toggle" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-slate-300" {{ 'checked' if plan.carry_forward else '' }}>
+      <span>
+        <b class="text-sky-950">Carry forward from prior year</b>
+        <span class="block text-xs text-sky-900">{{ prior.name }} ({{ prior.status|lower }}). Attaches last year's fulfilment history, pre-fills last year's owner, and tags each item so the firm asks only for what repeats or changes.</span>
+      </span>
+    </label>
+    {% if plan.carry_forward %}
+    <div class="flex flex-wrap gap-1.5 text-[11px] font-medium">
+      {% for tag, n in plan.carry_counts.items() %}
+        <span class="rounded-full px-2 py-0.5 ring-1 ring-inset {{ 'bg-emerald-100 text-emerald-900 ring-emerald-300' if tag == 'Same as last year' else ('bg-sky-100 text-sky-900 ring-sky-300' if tag == 'New this year' else 'bg-amber-100 text-amber-900 ring-amber-300') }}">{{ n }} {{ tag|lower }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div class="grid gap-4 border-b border-slate-200 bg-slate-50 px-5 py-4 md:grid-cols-3">
+    <div>
+      <label class="block text-xs font-medium text-slate-600" for="tpl-select">Template</label>
+      <select id="tpl-select" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
+        {% for t in engagement_types %}<option value="{{ t }}" {{ 'selected' if t == chosen else '' }}>{{ t }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-slate-600" for="default-owner">Default client owner <span class="text-slate-400">(a named person)</span></label>
+      <input id="default-owner" name="default_owner" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="e.g. Ravi Menon (Accountant)">
+    </div>
+    <div>
+      <div class="flex items-center justify-between">
+        <span class="text-xs font-medium text-slate-600">Entity profile</span>
+        <button type="button" id="edit-profile" class="text-xs font-medium text-sky-700 hover:underline">Edit profile</button>
+      </div>
+      <div class="mt-1 flex flex-wrap gap-1">
+        {% for f in profile_fields if f.kind == 'bool' and plan.profile[f.key] %}
+          <span class="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">{{ f.key }}</span>
+        {% endfor %}
+        <span class="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-700">turnover {{ plan.profile.turnover_inr|inr_cr }}</span>
+      </div>
+      <div class="mt-1 flex flex-wrap gap-1">
+        {% for f in profile_fields if f.kind == 'bool' and not plan.profile[f.key] %}
+          <span class="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-500 line-through">{{ f.key }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="flex flex-wrap items-center gap-x-5 gap-y-1 border-b border-slate-200 px-5 py-3 text-sm">
+    <span><b class="text-emerald-700">{{ plan.to_create|length }}</b> to create</span>
+    <span><b class="text-amber-700">{{ plan.existing|length }}</b> already held</span>
+    <span><b class="text-slate-700">{{ plan.suppressed|length }}</b> suppressed by the entity profile</span>
+  </div>
+
+  {# ---- Items that will become requests ---- #}
+  <section class="px-5 py-4">
+    <h4 class="text-sm font-semibold text-slate-900">Will be created as Drafted</h4>
+    {% if plan.to_create %}
+    <div class="mt-2 overflow-x-auto rounded-lg border border-slate-200">
+      <table class="min-w-full divide-y divide-slate-200 text-sm">
+        <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+          <tr>
+            <th class="w-8 px-3 py-2"><input type="checkbox" id="check-all" checked aria-label="Select all" class="h-4 w-4 rounded border-slate-300"></th>
+            <th class="px-3 py-2 font-medium">Document</th>
+            <th class="px-3 py-2 font-medium">Client owner</th>
+            <th class="px-3 py-2 font-medium">Significance</th>
+            <th class="px-3 py-2 font-medium">Priority</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100">
+          {% for r in plan.to_create %}
+          <tr>
+            <td class="px-3 py-2 align-top">
+              <input type="checkbox" name="include" value="{{ r.item.id }}" {{ 'checked' if r.default_include else '' }} class="row-check mt-1 h-4 w-4 rounded border-slate-300">
+              <input type="hidden" name="item_id" value="{{ r.item.id }}">
+            </td>
+            <td class="px-3 py-2 align-top">
+              <div class="font-medium text-slate-900">{{ r.document }}
+                {% if r.carry_tag %}<span class="ml-1 rounded-full px-2 py-0.5 align-middle text-[11px] font-semibold ring-1 ring-inset {{ 'bg-emerald-100 text-emerald-900 ring-emerald-300' if r.carry_tag == 'Same as last year' else ('bg-sky-100 text-sky-900 ring-sky-300' if r.carry_tag == 'New this year' else 'bg-amber-100 text-amber-900 ring-amber-300') }}">{{ r.carry_tag }}</span>{% endif %}</div>
+              {% if r.carry %}
+              <div class="mt-0.5 text-xs text-sky-900">Last year {{ r.carry.ref }}: {{ r.carry.state|lower }} after {{ r.carry.attempts }} attempt{{ '' if r.carry.attempts == 1 else 's' }}, {{ r.carry.chases }} chase{{ '' if r.carry.chases == 1 else 's' }}, {{ r.carry.days }} days{% if r.carry.rejections %} · rejected for: {{ r.carry.rejections|join(', ') }}{% endif %}</div>
+              {% endif %}
+              {% if r.description %}<div class="text-xs text-slate-500">{{ r.description }}</div>{% endif %}
+              <div class="mt-0.5 text-[11px] text-slate-400">{{ period_text(r) }}{% if r.basis %} · {{ r.basis }}{% endif %}</div>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <input name="owner" value="{{ r.carry.owner_person if r.carry else '' }}" class="w-44 rounded-md border border-slate-300 px-2 py-1.5 text-sm" placeholder="(default owner)">
+            </td>
+            <td class="px-3 py-2 align-top">
+              <select name="significance" class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm">
+                {% for s in significance_options %}<option value="{{ s }}" {{ 'selected' if s == r.item.significance_default else '' }}>{{ s }}</option>{% endfor %}
+              </select>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <select name="priority" class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm">
+                {% for p in range(1, 6) %}<option value="{{ p }}" {{ 'selected' if p == r.item.priority_default else '' }}>P{{ p }}</option>{% endfor %}
+              </select>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="mt-2 rounded-md bg-slate-50 px-3 py-3 text-sm text-slate-500 ring-1 ring-slate-200">Nothing new to create from this template.</p>
+    {% endif %}
+  </section>
+
+  {# ---- Duplicate prevention: who already holds it ---- #}
+  {% if plan.existing %}
+  <section class="px-5 pb-4">
+    <h4 class="text-sm font-semibold text-slate-900">Already held - will be skipped</h4>
+    <ul class="mt-2 space-y-1.5">
+      {% for r in plan.existing %}
+      <li class="rounded-md bg-amber-50 px-3 py-2 text-sm ring-1 ring-amber-200">
+        <span class="font-medium text-amber-950">{{ r.document }}</span>
+        <span class="text-amber-900"> - {{ {'live': 'already requested and still open', 'accepted': 'already accepted', 'generated': 'already raised from this template item'}[r.existing_kind] }}:
+          <b>{{ r.existing.ref }}</b> ({{ r.existing.state }}), held by <b>{{ r.existing.owner_person }}</b></span>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {# ---- Suppressed items accordion ---- #}
+  <section class="px-5 pb-4">
+    <details class="group rounded-lg border border-slate-200 bg-white" {{ 'open' if plan.suppressed else '' }}>
+      <summary class="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-semibold text-slate-900">
+        <span>Suppressed items <span class="ml-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900">{{ plan.suppressed|length }}</span></span>
+        <span class="text-xs font-normal text-slate-400 group-open:hidden">show</span>
+        <span class="hidden text-xs font-normal text-slate-400 group-open:inline">hide</span>
+      </summary>
+      <div class="border-t border-slate-200 px-4 py-3">
+        {% if plan.suppressed %}
+        <p class="mb-2 text-xs text-slate-500">No request is created for these. When you generate, each is recorded with its rule so the list can be explained, not just shortened.</p>
+        <ul class="space-y-1.5">
+          {% for r in plan.suppressed %}
+          <li class="rounded-md bg-slate-50 px-3 py-2 text-sm ring-1 ring-slate-200">
+            <div class="font-medium text-slate-900">{{ r.document }}</div>
+            <div class="text-xs text-slate-600">{{ r.basis }}</div>
+            <div class="mt-0.5 font-mono text-[11px] text-slate-400">rule: {{ r.rule }}</div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p class="text-sm text-slate-500">Nothing is suppressed for this entity.</p>
+        {% endif %}
+
+        {% if recorded %}
+        <h5 class="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Recorded on this engagement's list ({{ recorded|length }})</h5>
+        <ul class="mt-1 space-y-1">
+          {% for s in recorded %}
+          <li class="text-xs text-slate-600"><b class="text-slate-800">{{ s.document }}</b> - {{ s.condition_basis }}
+            <span class="text-slate-400">· {{ s.template_label }} · {{ s.at|ist }} · {{ s.actor }}</span></li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </div>
+    </details>
+  </section>
+
+  <div id="gen-error" class="mx-5 mb-3 hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></div>
+  <div id="gen-result" class="mx-5 mb-3 hidden"></div>
+
+  <div class="sticky bottom-0 flex items-center justify-between gap-3 border-t border-slate-200 bg-white px-5 py-3">
+    <p class="text-xs text-slate-500">Creates each ticked item as a request with event #1 (Drafted). Nothing reaches the client until it is marked Sent.</p>
+    <button type="submit" id="gen-submit" class="shrink-0 rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700">Generate / Release requests</button>
+  </div>
+</form>

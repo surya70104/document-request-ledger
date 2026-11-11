@@ -1,0 +1,9 @@
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+sqlalchemy>=2.0.30,<2.1
+psycopg2-binary>=2.9.9,<3.0
+pydantic>=2.7,<3.0
+jinja2>=3.1,<4.0
+python-dotenv>=1.0,<2.0
+# Required by FastAPI to parse the HTML form posts (Form(...)) used by the UI.
+python-multipart>=0.0.9

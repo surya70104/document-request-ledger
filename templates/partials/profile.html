@@ -1,0 +1,46 @@
+{# Entity profile editor with a live "conditioning adapts" panel. #}
+<div class="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+  <div>
+    <h3 class="text-base font-semibold text-slate-900">Entity profile</h3>
+    <p class="text-xs text-slate-500">{{ eng.client_name }} · conditions on template items are evaluated against these answers.</p>
+  </div>
+  <button type="button" data-close-profile class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
+    <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+  </button>
+</div>
+
+<div class="grid gap-0 md:grid-cols-2">
+  <form id="profile-form" data-engagement="{{ eng.id }}" class="space-y-3 border-b border-slate-200 px-5 py-4 md:border-b-0 md:border-r">
+    <input type="hidden" name="type" value="{{ chosen }}">
+    {% for f in profile_fields %}
+      {% if f.kind == 'bool' %}
+      <label class="flex cursor-pointer items-start gap-3 rounded-md px-1 py-1 hover:bg-slate-50">
+        <input type="checkbox" name="{{ f.key }}" value="on" {{ 'checked' if profile[f.key] else '' }} class="mt-0.5 h-4 w-4 rounded border-slate-300">
+        <span>
+          <span class="block text-sm font-medium text-slate-800">{{ f.label }} <code class="ml-1 rounded bg-slate-100 px-1 text-[11px] font-normal text-slate-500">{{ f.key }}</code></span>
+          {% if f.hint %}<span class="block text-xs text-slate-500">{{ f.hint }}</span>{% endif %}
+        </span>
+      </label>
+      {% else %}
+      <div class="px-1 pt-1">
+        <label class="block text-sm font-medium text-slate-800" for="p-turnover">{{ f.label }} (INR crore) <code class="ml-1 rounded bg-slate-100 px-1 text-[11px] font-normal text-slate-500">{{ f.key }}</code></label>
+        <input id="p-turnover" type="number" step="0.01" min="0" name="turnover_cr" value="{{ '%.2f' % (profile[f.key] / 10000000) }}"
+               class="mt-1 w-40 rounded-md border border-slate-300 px-3 py-2 text-sm">
+      </div>
+      {% endif %}
+    {% endfor %}
+    <p id="profile-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+    <div class="flex justify-end gap-2 pt-2">
+      <button type="button" data-close-profile class="rounded-md border border-slate-300 px-3.5 py-2 text-sm text-slate-700 hover:bg-slate-100">Cancel</button>
+      <button type="submit" class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Save profile</button>
+    </div>
+  </form>
+
+  <div class="px-5 py-4">
+    <div class="flex items-center justify-between">
+      <h4 class="text-sm font-semibold text-slate-900">Effect on the requirement list</h4>
+      <span class="text-[11px] text-slate-400">updates as you toggle</span>
+    </div>
+    <div id="profile-impact" class="mt-2">{% include "partials/impact.html" %}</div>
+  </div>
+</div>
