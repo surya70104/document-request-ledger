@@ -7,11 +7,13 @@ Design rules (from the module spec):
   * `request_event` is strictly append-only. There is no UPDATE or DELETE path in the application
     (ORM listeners below refuse them) and PostgreSQL triggers (see database.py) refuse them too.
 """
+import secrets
 from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -158,6 +160,12 @@ class Engagement(Base):
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="Active")
     report_date: Mapped[Optional[date]] = mapped_column(Date)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Pass 1 completion: where the client link / reminders go, who escalations go to, and the
+    # ageing thresholds (days outstanding) for the amber warning and the partner escalation.
+    client_email: Mapped[Optional[str]] = mapped_column(String(200))
+    partner_email: Mapped[Optional[str]] = mapped_column(String(200))
+    age_warn_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14, server_default=text("14"))
+    age_escalate_days: Mapped[int] = mapped_column(Integer, nullable=False, default=21, server_default=text("21"))
     # Entity profile: flags/attributes that template-item conditions are evaluated against.
     entity_profile: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
@@ -182,6 +190,8 @@ class RequestTemplate(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    published_by: Mapped[Optional[str]] = mapped_column(String(200))  # NULL = shipped with the module
+    change_note: Mapped[Optional[str]] = mapped_column(Text)
 
     items: Mapped[list["TemplateItem"]] = relationship(
         back_populates="template", order_by="TemplateItem.position"
@@ -434,6 +444,86 @@ class Arrival(Base):
 
 
 # --------------------------------------------------------------------------------------------
+# Pass 1 completion: outbound email log, chase records, tokenised client links
+# --------------------------------------------------------------------------------------------
+EMAIL_KINDS = ("request_batch", "client_link", "chase", "escalation")
+
+
+class OutboundEmail(Base):
+    """Every email the module sends (or would send). Written whether or not SMTP is configured, so
+    the Outbox page always shows exactly what went to the client. Append-only."""
+
+    __tablename__ = "outbound_email"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    engagement_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("engagement.id", ondelete="RESTRICT"), index=True
+    )
+    request_id: Mapped[Optional[int]] = mapped_column(ForeignKey("request.id", ondelete="RESTRICT"))
+    token_id: Mapped[Optional[int]] = mapped_column(Integer)
+    to_address: Mapped[str] = mapped_column(String(200), nullable=False)
+    from_address: Mapped[str] = mapped_column(String(200), nullable=False)
+    subject: Mapped[str] = mapped_column(String(300), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    # 'logged' = stored in the local Outbox only (no SMTP configured); 'sent' = handed to the SMTP
+    # server; 'failed' = SMTP refused it (the error is kept).
+    status: Mapped[str] = mapped_column(String(10), nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(200), nullable=False)
+
+
+class Chase(Base):
+    """Section 9 `chase`: one row per chase alongside the append-only CHASED event. Only the
+    delivery flags change after insert (false -> true); the database refuses anything else."""
+
+    __tablename__ = "chase"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[int] = mapped_column(
+        ForeignKey("request.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    event_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("request_event.id", ondelete="RESTRICT"), unique=True
+    )
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    channel: Mapped[str] = mapped_column(String(30), nullable=False)
+    by_whom: Mapped[str] = mapped_column("by", String(200), nullable=False)
+    template: Mapped[Optional[str]] = mapped_column(String(120))
+    delivered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    opened: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    email_id: Mapped[Optional[int]] = mapped_column(ForeignKey("outbound_email.id", ondelete="RESTRICT"))
+
+
+class ClientToken(Base):
+    """The no-login link a client opens to upload: one per engagement at a time, time-limited,
+    re-sendable and revocable. Only `revoked_at` ever changes."""
+
+    __tablename__ = "client_token"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    engagement_id: Mapped[int] = mapped_column(
+        ForeignKey("engagement.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, default=lambda: secrets.token_urlsafe(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    def status(self, now: Optional[datetime] = None) -> str:
+        now = now or utcnow()
+        if self.revoked_at is not None:
+            return "revoked"
+        if self.expires_at <= now:
+            return "expired"
+        return "active"
+
+
+# --------------------------------------------------------------------------------------------
 # Application-level append-only guards
 # --------------------------------------------------------------------------------------------
 @event.listens_for(RequestEvent, "before_update")
@@ -471,6 +561,6 @@ def _refuse_update_if_modified(mapper, connection, target):  # noqa: ANN001
         _refuse_mutation(mapper, connection, target)
 
 
-for _cls in (RequestTemplate, TemplateItem, RequestSuppression, Arrival):
+for _cls in (RequestTemplate, TemplateItem, RequestSuppression, Arrival, OutboundEmail):
     event.listen(_cls, "before_update", _refuse_update_if_modified)
     event.listen(_cls, "before_delete", _refuse_mutation)

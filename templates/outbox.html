@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Outbox{% endblock %}
+
+{% block content %}
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <a href="/" class="text-sm text-sky-700 hover:underline">&larr; Back to the ledger</a>
+    <h2 class="mt-1 text-xl font-semibold text-slate-900">Outbox</h2>
+    <p class="text-sm text-slate-500">Every email the ledger sends: release batches, client links, chases and escalations.</p>
+  </div>
+  <form method="get" class="flex items-center gap-2 text-sm">
+    <label for="eng" class="text-slate-500">Engagement</label>
+    <select id="eng" name="eng" onchange="this.form.submit()" class="rounded-md border border-slate-300 bg-white px-2.5 py-1.5">
+      <option value="">All</option>
+      {% for e in engagements %}<option value="{{ e.id }}" {{ 'selected' if e.id == filter_eng else '' }}>{{ e.name }}</option>{% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="mt-4 rounded-lg border px-4 py-3 text-sm {{ 'border-emerald-300 bg-emerald-50 text-emerald-950' if smtp else 'border-sky-300 bg-sky-50 text-sky-950' }}">
+  {% if smtp %}<b>SMTP is configured.</b> Emails are handed to your mail server and also kept here.
+  {% else %}<b>Local outbox mode - no SMTP server configured.</b> Nothing leaves this machine. Emails are stored here, and the links inside them work on localhost, so you can try the whole client flow. Set <code>SMTP_HOST</code> in <code>.env</code> to send for real.{% endif %}
+</div>
+
+<div class="mt-4 space-y-3">
+  {% for m in emails %}
+  <details class="group rounded-lg border border-slate-200 bg-white shadow-sm" {{ 'open' if loop.first else '' }}>
+    <summary class="flex cursor-pointer list-none flex-wrap items-center justify-between gap-2 px-4 py-3">
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide text-slate-700">{{ m.kind|replace('_', ' ') }}</span>
+          {% if m.status == 'sent' %}<span class="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-900">Sent via SMTP</span>
+          {% elif m.status == 'logged' %}<span class="rounded-full bg-sky-100 px-2 py-0.5 text-[11px] font-semibold text-sky-900">Local outbox</span>
+          {% else %}<span class="rounded-full bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-900">Failed</span>{% endif %}
+        </div>
+        <div class="mt-1 truncate font-medium text-slate-900">{{ m.subject }}</div>
+        <div class="text-xs text-slate-500">to {{ m.to_address or '(no address)' }} · by {{ m.created_by }}</div>
+      </div>
+      <time class="text-xs text-slate-500" datetime="{{ m.created_at.isoformat() }}">{{ m.created_at|ist }}</time>
+    </summary>
+    <div class="border-t border-slate-200 px-4 py-3">
+      <dl class="mb-2 grid grid-cols-[auto_1fr] gap-x-3 text-xs text-slate-500">
+        <dt>From</dt><dd class="text-slate-700">{{ m.from_address }}</dd>
+        <dt>To</dt><dd class="text-slate-700">{{ m.to_address }}</dd>
+        <dt>Subject</dt><dd class="text-slate-700">{{ m.subject }}</dd>
+      </dl>
+      {% if m.error %}<p class="mb-2 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200">{{ m.error }}</p>{% endif %}
+      <pre class="whitespace-pre-wrap break-words rounded-md bg-slate-50 p-3 font-sans text-sm leading-relaxed text-slate-800 ring-1 ring-slate-200">{{ m.body|linkify }}</pre>
+    </div>
+  </details>
+  {% else %}
+  <div class="rounded-lg border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">
+    No emails yet. They appear here when you release requests, send a client link, or chase by email.
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

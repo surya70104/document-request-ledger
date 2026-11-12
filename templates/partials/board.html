@@ -4,9 +4,9 @@
 
 {% macro age_badge(row) -%}
   {% if row.band == 'crit' %}
-    <span class="inline-flex items-center gap-1 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-semibold text-white" title="More than {{ age_crit }} days outstanding - escalate">{{ row.age }}d<span class="text-[10px] font-medium uppercase tracking-wide opacity-90">escalate</span></span>
+    <span class="inline-flex items-center gap-1 rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-semibold text-white" title="More than {{ b.crit }} days outstanding - escalate">{{ row.age }}d<span class="text-[10px] font-medium uppercase tracking-wide opacity-90">escalate</span></span>
   {% elif row.band == 'warn' %}
-    <span class="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-inset ring-amber-300" title="More than {{ age_warn }} days outstanding">{{ row.age }}d</span>
+    <span class="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-inset ring-amber-300" title="More than {{ b.warn }} days outstanding">{{ row.age }}d</span>
   {% else %}
     <span class="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-700 ring-1 ring-inset ring-slate-200">{{ row.age }}d</span>
   {% endif %}
@@ -41,6 +41,7 @@
           <div class="flex flex-wrap items-center gap-2">
             <span class="font-mono text-xs text-slate-500">{{ row.ref }}</span>
             {% if row.material %}<span class="rounded-full bg-rose-600 px-2 py-0.5 text-[11px] font-semibold text-white">Material</span>{% endif %}
+            {% if row.escalated %}<span class="rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-medium text-red-800 ring-1 ring-inset ring-red-300">Escalated</span>{% endif %}
             {% if row.attempts >= 2 %}<span class="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 ring-1 ring-inset ring-amber-300">Attempt {{ row.attempts }}</span>{% endif %}
           </div>
           <div class="font-medium text-slate-900">{{ row.document }}</div>
@@ -80,8 +81,8 @@
   {% for label, value, tone in [
     ('Outstanding with client', s.outstanding, 'text-slate-900'),
     ('Material', s.material, 'text-rose-700'),
-    ('Over ' ~ age_warn ~ ' days', s.warn + s.crit, 'text-amber-700'),
-    ('Over ' ~ age_crit ~ ' days', s.crit, 'text-red-700'),
+    ('Over ' ~ b.warn ~ ' days', s.warn + s.crit, 'text-amber-700'),
+    ('Over ' ~ b.crit ~ ' days', s.crit, 'text-red-700'),
     ('Chased 3+ times', s.chased_3plus, 'text-orange-700'),
     ('Client owners', s.owners, 'text-slate-900'),
   ] %}
@@ -112,12 +113,26 @@
   </div>
 </div>
 <p class="mt-2 text-xs text-slate-500">
-  {% if b.cut == 'age' %}Longest outstanding first. Amber past {{ age_warn }} days, red past {{ age_crit }} (escalate).
-  {% elif b.cut == 'owner' %}Grouped by the named person on the client side - who is sitting on how much.
-  {% elif b.cut == 'significance' %}Material-to-the-opinion requests are pinned above everything else and are never hidden by the filter.
-  {% else %}Most-chased first - requests chased repeatedly with nothing arriving rise to the top.{% endif %}
-  The filter never hides a Material request.
+  Material requests are pinned at the top of every cut and are never hidden by the filter.
+  {% if b.cut == 'age' %}Below them: longest outstanding first. Amber past {{ b.warn }} days, red past {{ b.crit }} (escalate to the partner).
+  {% elif b.cut == 'owner' %}Below them: grouped by the named person on the client side - who is sitting on how much.
+  {% elif b.cut == 'significance' %}Below them: the routine requests, oldest first.
+  {% else %}Below them: most-chased first - requests chased repeatedly with nothing arriving rise to the top.{% endif %}
 </p>
+
+{# ---- escalation ---- #}
+{% if s.to_escalate %}
+<div class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-950" id="escalation-bar">
+  <span><b>{{ s.to_escalate }}</b> request{{ '' if s.to_escalate == 1 else 's' }} past the {{ b.crit }}-day escalation threshold {{ 'has' if s.to_escalate == 1 else 'have' }} not been escalated to the partner.</span>
+  {% if b.engagement.status == 'Active' %}
+    {% if b.partner_email %}
+    <button type="button" data-escalate="{{ b.engagement.id }}" class="rounded-md bg-red-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-800">Escalate to {{ b.partner_email }}</button>
+    {% else %}
+    <button type="button" data-open-settings class="rounded-md border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-900 hover:bg-red-100">Set the partner's email to escalate</button>
+    {% endif %}
+  {% endif %}
+</div>
+{% endif %}
 
 {# ---- the cut ---- #}
 <div class="mt-3 space-y-4">
@@ -125,41 +140,39 @@
     <div class="rounded-lg border border-dashed border-slate-300 bg-white p-8 text-center text-sm text-slate-500">
       Nothing is outstanding with the client. Requests appear here once they are Sent and until they are Submitted.
     </div>
+  {% else %}
 
-  {% elif b.cut == 'owner' %}
-    {% for g in b.groups %}
-    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
-        <div>
-          <div class="font-semibold text-slate-900">{{ g.name }}{% if g.role %} <span class="font-normal text-slate-500">· {{ g.role }}</span>{% endif %}</div>
-          <div class="text-xs text-slate-500">sitting on <b class="text-slate-900">{{ g.rows|length }}</b> request{{ '' if g.rows|length == 1 else 's' }}</div>
-        </div>
-        <div class="flex flex-wrap items-center gap-2 text-xs">
-          {% if g.material %}<span class="rounded-full bg-rose-600 px-2 py-0.5 font-semibold text-white">{{ g.material }} material</span>{% endif %}
-          <span class="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-900 ring-1 ring-inset ring-orange-300">{{ g.chases }} chase{{ '' if g.chases == 1 else 's' }}</span>
-          <span class="rounded-full px-2 py-0.5 font-medium ring-1 ring-inset {{ 'bg-red-100 text-red-800 ring-red-300' if g.band == 'crit' else ('bg-amber-100 text-amber-900 ring-amber-300' if g.band == 'warn' else 'bg-slate-100 text-slate-700 ring-slate-200') }}">oldest {{ g.oldest }}d</span>
-        </div>
-      </header>
-      {{ board_table(g.rows, show_owner=False) }}
-    </section>
-    {% endfor %}
-
-  {% elif b.cut == 'significance' %}
-    <section class="overflow-hidden rounded-lg border-2 border-rose-300 bg-white shadow-sm">
+    {# Material and open: pinned above every cut, never filtered away #}
+    <section id="board-pinned" class="overflow-hidden rounded-lg border-2 border-rose-300 bg-white shadow-sm">
       <header class="flex items-center justify-between gap-2 border-b border-rose-200 bg-rose-50 px-4 py-3">
-        <div class="font-semibold text-rose-950">Material to the opinion <span class="ml-1 rounded-full bg-rose-600 px-2 py-0.5 text-xs font-semibold text-white">{{ b.material_rows|length }}</span></div>
+        <div class="font-semibold text-rose-950">Material to the opinion - open <span class="ml-1 rounded-full bg-rose-600 px-2 py-0.5 text-xs font-semibold text-white">{{ b.pinned|length }}</span></div>
         <span class="text-xs font-medium text-rose-800">Pinned - cannot be hidden or filtered away</span>
       </header>
-      {% if b.material_rows %}{{ board_table(b.material_rows) }}{% else %}<p class="px-4 py-5 text-sm text-slate-500">No material request is outstanding.</p>{% endif %}
-    </section>
-    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-      <header class="border-b border-slate-200 bg-slate-50 px-4 py-3 font-semibold text-slate-900">Routine <span class="ml-1 rounded-full bg-slate-200 px-2 py-0.5 text-xs font-medium text-slate-700">{{ b.routine_rows|length }}</span></header>
-      {% if b.routine_rows %}{{ board_table(b.routine_rows) }}{% else %}<p class="px-4 py-5 text-sm text-slate-500">No routine request is outstanding.</p>{% endif %}
+      {% if b.pinned %}{{ board_table(b.pinned) }}{% else %}<p class="px-4 py-5 text-sm text-slate-500">No material request is outstanding.</p>{% endif %}
     </section>
 
-  {% else %}
-    <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
-      {{ board_table(b.rows) }}
-    </section>
+    {% if b.cut == 'owner' %}
+      {% for g in b.groups %}
+      <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
+          <div>
+            <div class="font-semibold text-slate-900">{{ g.name }}{% if g.role %} <span class="font-normal text-slate-500">· {{ g.role }}</span>{% endif %}</div>
+            <div class="text-xs text-slate-500">sitting on <b class="text-slate-900">{{ g.total }}</b> request{{ '' if g.total == 1 else 's' }}{% if g.material %} · {{ g.material }} pinned above{% endif %}</div>
+          </div>
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            {% if g.material %}<span class="rounded-full bg-rose-600 px-2 py-0.5 font-semibold text-white">{{ g.material }} material</span>{% endif %}
+            <span class="rounded-full bg-orange-100 px-2 py-0.5 font-medium text-orange-900 ring-1 ring-inset ring-orange-300">{{ g.chases }} chase{{ '' if g.chases == 1 else 's' }}</span>
+            <span class="rounded-full px-2 py-0.5 font-medium ring-1 ring-inset {{ 'bg-red-100 text-red-800 ring-red-300' if g.band == 'crit' else ('bg-amber-100 text-amber-900 ring-amber-300' if g.band == 'warn' else 'bg-slate-100 text-slate-700 ring-slate-200') }}">oldest {{ g.oldest }}d</span>
+          </div>
+        </header>
+        {% if g.rows %}{{ board_table(g.rows, show_owner=False) }}{% else %}<p class="px-4 py-4 text-sm text-slate-500">Everything this person holds is material and shown in the pinned band above.</p>{% endif %}
+      </section>
+      {% endfor %}
+    {% elif b.body %}
+      <section class="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+        <header class="border-b border-slate-200 bg-slate-50 px-4 py-3 font-semibold text-slate-900">Routine <span class="ml-1 rounded-full bg-slate-200 px-2 py-0.5 text-xs font-medium text-slate-700">{{ b.body|length }}</span></header>
+        {{ board_table(b.body) }}
+      </section>
+    {% endif %}
   {% endif %}
 </div>

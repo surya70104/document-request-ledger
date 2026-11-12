@@ -45,7 +45,13 @@
     <div class="flex flex-wrap gap-2">
       <a href="/engagements/{{ selected.id }}/close-out"
          class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Close-out &amp; evidence</a>
+      <button id="open-templates" type="button"
+              class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Templates</button>
     {% if selected.status == 'Active' %}
+      <button id="open-clientlink" type="button"
+              class="rounded-md border border-emerald-600 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-900 hover:bg-emerald-100">Client link</button>
+      <button id="open-settings" type="button"
+              class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Settings</button>
       <button id="open-profile" type="button" data-engagement="{{ selected.id }}"
               class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Entity profile</button>
       <button id="open-requirements" type="button" data-engagement="{{ selected.id }}"
@@ -92,11 +98,18 @@
     <span class="text-xs text-slate-400">Material &amp; open requests stay pinned to the top regardless.</span>
   </div>
 
+  {# ---- Batch release bar (appears when Drafted requests are ticked) ---- #}
+  <div id="release-bar" class="mt-3 hidden items-center justify-between gap-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-950 [&:not(.hidden)]:flex">
+    <span id="release-count" class="font-medium"></span>
+    <button type="button" id="release-selected" data-engagement="{{ selected.id }}" class="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800">Release selected (Send)</button>
+  </div>
+
   {# ---- Request list ---- #}
   <div class="mt-3 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
     <table class="min-w-full divide-y divide-slate-200 text-sm">
       <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
         <tr>
+          <th class="w-8 px-3 py-2.5">{% if selected.status == 'Active' %}<input type="checkbox" id="rel-all" aria-label="Select all Drafted requests" class="h-4 w-4 rounded border-slate-300">{% endif %}</th>
           <th class="px-4 py-2.5 font-medium">Ref</th>
           <th class="px-4 py-2.5 font-medium">Document</th>
           <th class="px-4 py-2.5 font-medium">Client owner</th>
@@ -114,6 +127,7 @@
         <tr class="request-row cursor-pointer hover:bg-slate-50 {{ 'bg-rose-50/60' if r.is_material_open else '' }}"
             data-id="{{ r.id }}" data-open="{{ 1 if r.is_open else 0 }}" data-pinned="{{ 1 if r.is_material_open else 0 }}"
             tabindex="0" role="button" aria-label="Open audit trail for {{ r.ref }}">
+          <td class="w-8 px-3 py-3">{% if r.state == 'Drafted' and selected.status == 'Active' %}<input type="checkbox" class="rel-check h-4 w-4 rounded border-slate-300" value="{{ r.id }}" aria-label="Select {{ r.ref }} for release">{% endif %}</td>
           <td class="whitespace-nowrap px-4 py-3 font-mono text-xs text-slate-600">
             {{ r.ref }}<div class="text-[11px] text-slate-400">P{{ r.priority }}</div>
           </td>
@@ -135,7 +149,7 @@
           <td class="px-4 py-3 text-right tabular-nums {{ 'font-semibold text-amber-700' if r.attempt_count >= 3 else '' }}">{{ r.attempt_count }}</td>
           <td class="px-4 py-3 text-right tabular-nums" data-chase-badge="{{ r.id }}">{{ r.chase_count }}</td>
           <td class="whitespace-nowrap px-4 py-3 text-right tabular-nums
-              {% if r.is_open and age_band(age) == 'crit' %}font-semibold text-red-700{% elif r.is_open and age_band(age) == 'warn' %}font-medium text-amber-700{% else %}text-slate-600{% endif %}">
+              {% if r.is_open and age_band(age, selected.age_warn_days, selected.age_escalate_days) == 'crit' %}font-semibold text-red-700{% elif r.is_open and age_band(age, selected.age_warn_days, selected.age_escalate_days) == 'warn' %}font-medium text-amber-700{% else %}text-slate-600{% endif %}">
             {{ age }}d
           </td>
           <td class="whitespace-nowrap px-4 py-3 text-right">
@@ -146,7 +160,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="9" class="px-4 py-10 text-center text-slate-500">No requests in this engagement yet.</td></tr>
+        <tr><td colspan="10" class="px-4 py-10 text-center text-slate-500">No requests in this engagement yet.</td></tr>
         {% endfor %}
       </tbody>
     </table>
@@ -239,6 +253,17 @@
   </div>
 </div>
 {% endif %}
+
+{# ---------------- Pass 1 completion modals ---------------- #}
+<div id="clientlink-modal" class="fixed inset-0 z-[60] hidden items-start justify-center overflow-y-auto bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-label="Client upload link">
+  <div id="clientlink-body" class="my-8 w-full max-w-xl rounded-xl bg-white shadow-2xl"></div>
+</div>
+<div id="settings-modal" class="fixed inset-0 z-[65] hidden items-start justify-center overflow-y-auto bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-label="Engagement settings">
+  <div id="settings-body" class="my-8 w-full max-w-lg rounded-xl bg-white shadow-2xl"></div>
+</div>
+<div id="tpl-modal" class="fixed inset-0 z-[60] hidden items-start justify-center overflow-y-auto bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-label="Template manager">
+  <div id="tpl-body" class="my-6 w-full max-w-4xl rounded-xl bg-white shadow-2xl"></div>
+</div>
 
 {# ---------------- Inline chase modal ---------------- #}
 <div id="chase-modal" class="fixed inset-0 z-[70] hidden items-center justify-center bg-slate-900/50 p-4" role="dialog" aria-modal="true" aria-labelledby="chase-title">
@@ -336,7 +361,7 @@
   });
   document.querySelectorAll('.request-row').forEach((row) => {
     const open = () => openDrawer(row.dataset.id);
-    row.addEventListener('click', (e) => { if (e.target.closest('[data-chase]')) return; open(); });
+    row.addEventListener('click', (e) => { if (e.target.closest('[data-chase],input')) return; open(); });
     row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   });
 
@@ -610,21 +635,33 @@
       if (!sel.value) { err.textContent = 'Choose one of the eight reason codes.'; err.classList.remove('hidden'); return; }
       const actor = needActor(err); if (!actor) return;
       const label = sel.options[sel.selectedIndex].text;
-      const msg = sel.options[sel.selectedIndex].dataset.message;
+      const msg = rejectMessage(sel);
       if (!confirm(`Reject this document as "${label}"?\n\nThe client will be told: ${msg}\n\nThe document is re-requested immediately.`)) return;
       const fd = new FormData(); fd.set('action', 'reject'); fd.set('actor', actor); fd.set('reason_code', sel.value); fd.set('note', note);
+      fd.set('pages', ((document.getElementById('reject-pages') || {}).value || '').trim());
       const { ok, data } = await postForm(`/submissions/${panel.dataset.submission}/review`, fd);
       if (!ok) { err.textContent = data.error || 'Could not reject.'; err.classList.remove('hidden'); return; }
       dirty = true; await loadDrawer(reqId, `Rejected as <b>${esc(label)}</b> and re-requested.`);
     }
   });
-  body.addEventListener('change', (e) => {
-    if (e.target.id !== 'reject-code') return;
+  function rejectMessage(sel) {
+    if (!sel.value) return '';
+    const pages = ((document.getElementById('reject-pages') || {}).value || '').trim();
+    if (sel.value === 'INCOMPLETE' && pages) return `Pages are missing: ${pages}.`;
+    return sel.options[sel.selectedIndex].dataset.message;
+  }
+  function updateRejectExplainer() {
+    const sel = document.getElementById('reject-code');
+    if (!sel) return;
+    const pagesBox = document.getElementById('reject-pages-box');
+    if (pagesBox) pagesBox.classList.toggle('hidden', sel.value !== 'INCOMPLETE');
     const box = document.getElementById('reject-explainer');
-    const msg = e.target.value ? e.target.options[e.target.selectedIndex].dataset.message : '';
+    const msg = rejectMessage(sel);
     box.textContent = msg ? `Client will be told: ${msg}` : '';
     box.classList.toggle('hidden', !msg);
-  });
+  }
+  body.addEventListener('change', (e) => { if (e.target.id === 'reject-code') updateRejectExplainer(); });
+  body.addEventListener('input', (e) => { if (e.target.id === 'reject-pages') updateRejectExplainer(); });
 
 
 
@@ -775,9 +812,172 @@
       el.textContent = el.closest('#board-panel') ? `${data.chase_count}×` : String(data.chase_count);
       el.classList.add('ring-2', 'ring-orange-400');
     });
-    showToast(`Chase recorded on <b>${esc(ref)}</b> - now chased ${data.chase_count} time${data.chase_count === 1 ? '' : 's'}.`);
+    showToast(`Chase recorded on <b>${esc(ref)}</b> - now chased ${data.chase_count} time${data.chase_count === 1 ? '' : 's'}.` +
+      (data.emailed ? ' Emailed to the client with the upload link (see the <a class="underline" href="/outbox">Outbox</a>).' : '') +
+      (data.no_client_email ? ' No client email is set, so nothing was emailed.' : ''));
     if (currentId !== null && String(currentId) === String(id)) loadDrawer(id);
     if (boardPanel && !boardPanel.classList.contains('hidden')) setTimeout(() => loadBoard(), 900);
+  });
+
+
+  // ---------- Pass 1 completion: batch release, client link, settings, template manager, escalation ----------
+  const clModal = document.getElementById('clientlink-modal');
+  const clBody = document.getElementById('clientlink-body');
+  const setModal = document.getElementById('settings-modal');
+  const setBody = document.getElementById('settings-body');
+  const tplModal = document.getElementById('tpl-modal');
+  const tplBody = document.getElementById('tpl-body');
+  const engId = (document.getElementById('board-panel') || {}).dataset ? document.getElementById('board-panel').dataset.engagement : null;
+
+  function say(el, text, good) {
+    el.textContent = text;
+    el.className = 'rounded-md px-3 py-2 text-sm ' + (good ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200' : 'bg-rose-50 text-rose-800 ring-1 ring-rose-200');
+  }
+
+  // -- Batch release
+  const relBar = document.getElementById('release-bar');
+  function updateReleaseBar() {
+    if (!relBar) return;
+    const n = document.querySelectorAll('.rel-check:checked').length;
+    relBar.classList.toggle('hidden', n === 0);
+    document.getElementById('release-count').textContent = `${n} Drafted request${n === 1 ? '' : 's'} selected`;
+  }
+  document.addEventListener('change', (e) => {
+    if (e.target.id === 'rel-all') document.querySelectorAll('.rel-check').forEach((c) => { if (!c.closest('tr').classList.contains('hidden')) c.checked = e.target.checked; });
+    if (e.target.classList && (e.target.classList.contains('rel-check') || e.target.id === 'rel-all')) updateReleaseBar();
+  });
+  const relBtn = document.getElementById('release-selected');
+  if (relBtn) relBtn.addEventListener('click', async () => {
+    const actor = currentActor();
+    if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+    const ids = [...document.querySelectorAll('.rel-check:checked')].map((c) => c.value);
+    if (!ids.length) return;
+    if (!confirm(`Release ${ids.length} request${ids.length === 1 ? '' : 's'} to the client?\n\nEach is marked SENT (by email) and ONE email with the upload link and the list is sent to the client. This is recorded in the history of every request.`)) return;
+    relBtn.disabled = true;
+    const fd = new FormData(); fd.set('actor', actor); ids.forEach((i) => fd.append('request_id', i));
+    const { ok, data } = await postForm(`/engagements/${relBtn.dataset.engagement}/release`, fd);
+    relBtn.disabled = false;
+    if (!ok) { alert(data.error || 'Could not release the requests.'); return; }
+    showToast(`Released <b>${data.released.length}</b> request${data.released.length === 1 ? '' : 's'}. Email to ${esc(data.to)} (${data.status === 'sent' ? 'sent via SMTP' : 'in the local Outbox'}) - <a class="underline" href="/outbox?eng=${relBtn.dataset.engagement}">view it</a>.`);
+    setTimeout(() => location.reload(), 1800);
+  });
+
+  // -- Client link
+  async function loadClientLink() {
+    show(clModal);
+    clBody.innerHTML = '<p class="p-6 text-sm text-slate-500">Loading...</p>';
+    const res = await fetch(`/engagements/${engId}/client-link`);
+    clBody.innerHTML = await res.text();
+  }
+  const openCl = document.getElementById('open-clientlink');
+  if (openCl) openCl.addEventListener('click', loadClientLink);
+  if (clBody) clBody.addEventListener('click', async (e) => {
+    if (e.target.closest('[data-close-clientlink]')) { hide(clModal); return; }
+    const msg = document.getElementById('clientlink-msg');
+    const actor = currentActor();
+    const act = async (path, fd, okText) => {
+      if (!actor) { msg.classList.remove('hidden'); say(msg, "Enter your name in 'Acting as' (top right) first.", false); return; }
+      fd.set('actor', actor);
+      const { ok, data } = await postForm(`/engagements/${engId}/client-link/${path}`, fd);
+      if (!ok) { msg.classList.remove('hidden'); say(msg, data.error || 'That did not work.', false); return; }
+      return data;
+    };
+    if (e.target.id === 'copy-link') {
+      const box = document.getElementById('link-box');
+      try { await navigator.clipboard.writeText(box.value); } catch (x) { box.select(); document.execCommand('copy'); }
+      e.target.textContent = 'Copied';
+      setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+    }
+    if (e.target.id === 'generate-link') {
+      const fd = new FormData(); fd.set('days', document.getElementById('link-days').value || '30');
+      if (await act('generate', fd)) await loadClientLink();
+    }
+    if (e.target.id === 'resend-link') {
+      const d = await act('resend', new FormData());
+      if (d) { msg.classList.remove('hidden'); say(msg, `Emailed to ${d.to} (${d.status === 'sent' ? 'sent via SMTP' : 'local Outbox'}). Open the Outbox to see it.`, true); }
+    }
+    if (e.target.id === 'revoke-link') {
+      if (!confirm('Revoke this link? The client will no longer be able to use it.')) return;
+      const fd = new FormData(); fd.set('token_id', e.target.dataset.token);
+      if (await act('revoke', fd)) await loadClientLink();
+    }
+  });
+
+  // -- Engagement settings
+  async function openSettings() {
+    if (!engId) return;
+    show(setModal);
+    setBody.innerHTML = '<p class="p-6 text-sm text-slate-500">Loading...</p>';
+    setBody.innerHTML = await (await fetch(`/engagements/${engId}/settings`)).text();
+  }
+  const openSet = document.getElementById('open-settings');
+  if (openSet) openSet.addEventListener('click', openSettings);
+  document.addEventListener('click', (e) => { if (e.target.closest('[data-open-settings]')) openSettings(); });
+  if (setBody) {
+    setBody.addEventListener('click', (e) => { if (e.target.closest('[data-close-settings]')) hide(setModal); });
+    setBody.addEventListener('submit', async (e) => {
+      if (e.target.id !== 'settings-form') return;
+      e.preventDefault();
+      const err = document.getElementById('settings-error');
+      err.classList.add('hidden');
+      const { ok, data } = await postForm(`/engagements/${e.target.dataset.engagement}/settings`, new FormData(e.target));
+      if (!ok) { err.textContent = data.error || 'Could not save the settings.'; err.classList.remove('hidden'); return; }
+      hide(setModal);
+      location.reload();
+    });
+  }
+
+  // -- Escalation to the partner
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-escalate]');
+    if (!btn) return;
+    const actor = currentActor();
+    if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+    if (!confirm('Email the partner a digest of every request past the escalation threshold?\n\nA note "Escalated to the partner" is recorded on each of those requests.')) return;
+    btn.disabled = true;
+    const fd = new FormData(); fd.set('actor', actor);
+    const { ok, data } = await postForm(`/engagements/${btn.dataset.escalate}/escalate`, fd);
+    btn.disabled = false;
+    if (!ok) { alert(data.error || 'Could not escalate.'); return; }
+    showToast(`Escalated ${data.refs.length} request${data.refs.length === 1 ? '' : 's'} to the partner (${data.status === 'sent' ? 'sent via SMTP' : 'in the local Outbox'}).`);
+    dirty = true;
+    loadBoard();
+  });
+
+  // -- Template manager
+  async function loadTemplates(type, version) {
+    show(tplModal);
+    const qs = new URLSearchParams();
+    if (type) qs.set('type', type);
+    if (version) qs.set('version', version);
+    const res = await fetch('/templates/manager' + (qs.toString() ? `?${qs}` : ''));
+    tplBody.innerHTML = await res.text();
+  }
+  const openTpl = document.getElementById('open-templates');
+  if (openTpl) openTpl.addEventListener('click', () => loadTemplates());
+  if (tplBody) {
+    tplBody.addEventListener('click', (e) => { if (e.target.closest('[data-close-tpl]')) hide(tplModal); });
+    tplBody.addEventListener('change', (e) => {
+      if (e.target.id === 'tpl-type') loadTemplates(e.target.value);
+      if (e.target.id === 'tpl-version') loadTemplates(document.getElementById('tpl-type').value, e.target.value);
+    });
+    tplBody.addEventListener('submit', async (e) => {
+      if (e.target.id !== 'tpl-form') return;
+      e.preventDefault();
+      const err = document.getElementById('tpl-error');
+      err.classList.add('hidden');
+      const actor = currentActor();
+      if (!actor) { err.textContent = "Enter your name in 'Acting as' (top right) first."; err.classList.remove('hidden'); return; }
+      const fd = new FormData(e.target); fd.set('actor', actor);
+      const { ok, data } = await postForm('/templates/publish', fd);
+      if (!ok) { err.textContent = data.error || 'Could not publish.'; err.classList.remove('hidden'); return; }
+      await loadTemplates(data.type);
+      showToast(`Published <b>${esc(data.type)} v${data.version}</b>. Earlier versions are unchanged.`);
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    [setModal, clModal, tplModal].forEach((m) => { if (m && !m.classList.contains('hidden')) hide(m); });
   });
 
 })();

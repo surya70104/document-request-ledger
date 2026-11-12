@@ -33,6 +33,9 @@ TEST_DB_NAME = _url.database
 # Must be set BEFORE database.py / services.py are imported.
 os.environ["DATABASE_URL"] = _url.render_as_string(hide_password=False)
 os.environ["UPLOAD_DIR"] = tempfile.mkdtemp(prefix="ledger_test_uploads_")
+# Never send real email from the tests (even if .env has SMTP settings): local-outbox mode.
+os.environ["SMTP_HOST"] = ""
+os.environ["PUBLIC_BASE_URL"] = "http://testserver"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -95,6 +98,7 @@ def make_engagement(session):
             period_to=kw.pop("period_to", None) or __import__("datetime").date(2026, 3, 31),
             status="Active",
             entity_profile=services.normalise_profile(profile or {}),
+            **kw,
         )
         session.add(eng)
         session.commit()
@@ -118,3 +122,16 @@ def make_request(session):
         return req
 
     return _make
+
+
+@pytest.fixture()
+def client(session):
+    """A TestClient for the real app. App start-up runs DDL, so this test's session lets go of its
+    locks first."""
+    from fastapi.testclient import TestClient
+
+    import main
+
+    session.rollback()
+    with TestClient(main.app) as c:
+        yield c

@@ -91,9 +91,13 @@
     <select id="reject-code" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
       <option value="">Choose a reason...</option>
       {% for code, (label, msg) in reason_codes.items() %}
-      <option value="{{ code }}" data-message="{{ msg }}">{{ label }}</option>
+      <option value="{{ code }}" data-message="{{ reject_messages[code] }}">{{ label }}</option>
       {% endfor %}
     </select>
+    <div id="reject-pages-box" class="mt-2 hidden">
+      <label class="block text-xs font-medium text-slate-600" for="reject-pages">Which pages are missing? <span class="font-normal text-slate-400">(e.g. 4-6, 9 - leave blank if it cannot be determined)</span></label>
+      <input id="reject-pages" type="text" maxlength="200" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm" placeholder="pages 4-6">
+    </div>
     <p id="reject-explainer" class="mt-2 hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-900 ring-1 ring-rose-200"></p>
     <p class="mt-2 text-xs text-slate-500">Rejecting records the rejection and immediately re-requests the document (attempt {{ r.attempt_count + 1 }}). The request stays live.</p>
     <div class="mt-2 flex gap-2">
@@ -214,6 +218,8 @@
         {% for code, (label, msg) in reason_codes.items() %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
       </select>
       <p class="mt-1 text-xs text-slate-500">Rejecting appends a Rejected event and an automatic Re-requested event (next attempt).</p>
+      <label class="mt-2 block text-xs font-medium text-slate-600">Missing pages (for Incomplete, optional)</label>
+      <input type="text" name="pages" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm" placeholder="e.g. 4-6, 9">
       <label class="mt-2 block text-xs font-medium text-slate-600">Detail for the client (optional)</label>
       <input type="text" name="detail" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm" placeholder="e.g. Pages 4-6 are missing">
     </div>
@@ -274,6 +280,15 @@
       <div class="text-xs text-slate-600">
         by {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
       </div>
+      {% set ch = chases.get(ev.id) if chases else None %}
+      {% if ch %}
+      <div class="mt-1 flex flex-wrap gap-1.5 text-[11px]">
+        {% if ch.delivered %}<span class="rounded-full bg-emerald-100 px-2 py-0.5 font-medium text-emerald-900">Delivered {{ ch.delivered_at|ist }}</span>
+        {% else %}<span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">Not delivered by the system{{ ' (made by hand)' if ev.channel != 'Email' else ' (no client email)' }}</span>{% endif %}
+        {% if ch.opened %}<span class="rounded-full bg-sky-100 px-2 py-0.5 font-medium text-sky-900">Opened {{ ch.opened_at|ist }}</span>
+        {% else %}<span class="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600">Not opened yet</span>{% endif %}
+      </div>
+      {% endif %}
       {% set items = payload_items(ev) %}
       {% if items %}
       <dl class="mt-1.5 space-y-0.5 rounded-md bg-slate-50 px-3 py-2 text-xs ring-1 ring-slate-200">

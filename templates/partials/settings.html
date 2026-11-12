@@ -1,0 +1,40 @@
+{# Engagement settings: where emails go and the ageing thresholds. #}
+<div class="flex items-start justify-between gap-3 border-b border-slate-200 px-5 py-4">
+  <div>
+    <h3 class="text-base font-semibold text-slate-900">Engagement settings</h3>
+    <p class="text-xs text-slate-500">{{ eng.name }}</p>
+  </div>
+  <button type="button" data-close-settings class="rounded-md p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
+    <svg class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 5l3.7 3.7L13.7 5 15 6.3 11.3 10l3.7 3.7-1.3 1.3L10 11.3 6.3 15 5 13.7 8.7 10 5 6.3z"/></svg>
+  </button>
+</div>
+<form id="settings-form" data-engagement="{{ eng.id }}" class="space-y-4 px-5 py-4">
+  <div>
+    <label class="block text-xs font-medium text-slate-600" for="set-client">Client email <span class="font-normal text-slate-400">(release emails, client link, email chases)</span></label>
+    <input id="set-client" name="client_email" type="email" value="{{ eng.client_email or '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="accounts@client.example">
+  </div>
+  <div>
+    <label class="block text-xs font-medium text-slate-600" for="set-partner">Partner email <span class="font-normal text-slate-400">(escalations go here)</span></label>
+    <input id="set-partner" name="partner_email" type="email" value="{{ eng.partner_email or '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="partner@firm.example">
+  </div>
+  <fieldset class="rounded-lg border border-slate-200 p-3">
+    <legend class="px-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Ageing thresholds (days outstanding)</legend>
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="set-warn">Warning (amber)</label>
+        <input id="set-warn" name="age_warn_days" type="number" min="1" max="364" value="{{ eng.age_warn_days }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="set-crit">Escalate to partner (red)</label>
+        <input id="set-crit" name="age_escalate_days" type="number" min="2" max="365" value="{{ eng.age_escalate_days }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm">
+      </div>
+    </div>
+    <p class="mt-2 text-xs text-slate-500">Defaults are 14 and 21. A request outstanding longer than the escalation threshold turns red on the board and can be escalated to the partner by email.</p>
+  </fieldset>
+  <p class="text-xs text-slate-500">{{ 'SMTP is configured - emails are sent for real.' if smtp else 'No SMTP server configured - emails are kept in the local Outbox only.' }}</p>
+  <p id="settings-error" class="hidden rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200"></p>
+  <div class="flex justify-end gap-2 border-t border-slate-100 pt-3">
+    <button type="button" data-close-settings class="rounded-md border border-slate-300 px-3.5 py-2 text-sm text-slate-700 hover:bg-slate-100">Cancel</button>
+    <button type="submit" class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">Save settings</button>
+  </div>
+</form>

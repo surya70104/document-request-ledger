@@ -3,6 +3,7 @@
 Run:  python main.py      (serves on http://127.0.0.1:8015)
 """
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+import emailer
 import services
 from database import SessionLocal, ensure_database, init_db
 from conditions import CRORE, PROFILE_FIELDS, ConditionError
@@ -96,6 +98,8 @@ PAYLOAD_LABELS = {
     "template_item": "Template item",
     "condition_basis": "Condition basis",
     "template": "Chase template",
+    "pages": "Missing pages",
+    "escalation": "Escalated to",
     "carried_forward": "Carried forward",
 }
 HIDDEN_PAYLOAD_KEYS = {"reason_code", "automatic"}
@@ -158,6 +162,22 @@ def fsize(n) -> str:
 
 
 templates.env.filters["fsize"] = fsize
+
+_URL_RE = re.compile(r"(https?://[^\s<>\"']+)")
+
+
+def linkify(text: str):
+    """Escape the email body, then turn URLs into clickable links (opening in a new tab)."""
+    from markupsafe import Markup, escape
+
+    out = _URL_RE.sub(
+        lambda m: f'<a href="{m.group(1)}" target="_blank" rel="noopener" class="font-medium text-sky-700 underline break-all">{m.group(1)}</a>',
+        str(escape(text or "")),
+    )
+    return Markup(out)
+
+
+templates.env.filters["linkify"] = linkify
 templates.env.globals["pending_submission"] = services.pending_submission
 templates.env.globals.update(
     state_style=lambda s: STATE_STYLES.get(s, "bg-slate-100 text-slate-700 ring-slate-300"),
@@ -175,6 +195,8 @@ templates.env.globals.update(
     age_warn=services.AGE_WARN_DAYS,
     age_crit=services.AGE_CRIT_DAYS,
     firm_name=FIRM_NAME,
+    smtp_configured=emailer.smtp_configured,
+    link_url=emailer.client_link_url,
     profile_fields=PROFILE_FIELDS,
     engagement_types=ENGAGEMENT_TYPES,
 )
@@ -230,6 +252,12 @@ async def condition_error_handler(_: HttpRequest, exc: ConditionError):
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
+@app.exception_handler(services.TokenError)
+async def token_error_handler(_: HttpRequest, exc: services.TokenError):
+    code = 404 if exc.reason == "invalid" else 410
+    return JSONResponse(status_code=code, content={"error": str(exc), "reason": exc.reason})
+
+
 @app.exception_handler(services.LedgerError)
 async def ledger_error_handler(_: HttpRequest, exc: services.LedgerError):
     return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -279,6 +307,8 @@ def request_trail(http_request: HttpRequest, request_id: int, session: Session =
             "now": utcnow(),
             "carried_from": carried,
             "carried_note": (drafted.payload or {}).get("carried_forward") if drafted else None,
+            "chases": services.chases_by_event(session, req.id),
+            "reject_messages": {code: services.reason_message(code, req) for code in REASON_CODES},
         },
     )
 
@@ -350,6 +380,7 @@ def add_event(
     submitted_by: str = Form(""),
     filename: str = Form(""),
     note: str = Form(""),
+    pages: str = Form(""),
     session: Session = Depends(get_session),
 ):
     appended = services.append_event(
@@ -365,6 +396,7 @@ def add_event(
             "submitted_by": submitted_by,
             "filename": filename,
             "note": note,
+            "pages": pages,
         },
     )
     return {"ok": True, "appended": [{"seq": ev.seq, "event_type": ev.event_type} for ev in appended]}
@@ -409,10 +441,11 @@ def review_submission(
     actor: str = Form(""),
     reason_code: str = Form(""),
     note: str = Form(""),
+    pages: str = Form(""),
     session: Session = Depends(get_session),
 ):
     events = services.review_submission(
-        session, submission_id, action, actor, reason_code=reason_code, note=note
+        session, submission_id, action, actor, reason_code=reason_code, note=note, pages=pages
     )
     return {"ok": True, "appended": [{"seq": ev.seq, "event_type": ev.event_type} for ev in events]}
 
@@ -602,6 +635,9 @@ def chase_request(
         "seq": ev.seq,
         "chase_count": result["chase_count"],
         "note": (ev.payload or {}).get("note"),
+        "emailed": result["emailed"],
+        "delivered": result["chase"].delivered,
+        "no_client_email": result["no_client_email"],
     }
 
 
@@ -661,6 +697,202 @@ def closeout_download(engagement_id: int, doc: str, session: Session = Depends(g
     else:
         body, media, name = services.sa580_csv(rep), "text/csv; charset=utf-8", f"SA580-schedule-{ref}.csv"
     return Response(body, media_type=media, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# --------------------------------------------------------------------------------------------
+# Pass 1 completion: client link, outbox, settings, batch release, template manager
+# --------------------------------------------------------------------------------------------
+NO_STORE = {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Robots-Tag": "noindex, nofollow",
+}
+
+
+def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
+    payload = []
+    for f in files[:30]:
+        data = f.file.read(services.MAX_UPLOAD_BYTES + 1)
+        if not f.filename and not data:
+            continue  # an empty file input
+        payload.append((f.filename or "file", data))
+    return payload
+
+
+@app.get("/c/{token}", response_class=HTMLResponse)
+def client_page(http_request: HttpRequest, token: str, session: Session = Depends(get_session)):
+    """The no-login client page. Opening it acknowledges the Sent requests and marks chases opened."""
+    try:
+        opened = services.open_client_link(session, token)
+    except services.TokenError as exc:
+        resp = templates.TemplateResponse(
+            http_request, "client_error.html", {"message": str(exc), "reason": exc.reason},
+            status_code=404 if exc.reason == "invalid" else 410,
+        )
+        resp.headers.update(NO_STORE)
+        return resp
+    eng = opened["engagement"]
+    resp = templates.TemplateResponse(
+        http_request,
+        "client.html",
+        {"eng": eng, "token": token, "view": services.client_view(session, eng), "expires_at": opened["token"].expires_at},
+    )
+    resp.headers.update(NO_STORE)
+    return resp
+
+
+@app.post("/c/{token}/requests/{request_id}/upload")
+def client_upload(
+    token: str,
+    request_id: int,
+    files: list[UploadFile] = File(default=[]),
+    submitted_by: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    result = services.client_upload(session, token, request_id, _read_uploads(files), submitted_by)
+    return JSONResponse(
+        {
+            "ok": True,
+            "stored": len(result["new_files"]),
+            "repeats": [{"filename": a["file"].filename, "count": a["count"]} for a in result["arrivals"]],
+        },
+        headers=NO_STORE,
+    )
+
+
+@app.get("/outbox", response_class=HTMLResponse)
+def outbox(http_request: HttpRequest, eng: Optional[int] = None, session: Session = Depends(get_session)):
+    """Every email the module sent (or would send): open the links straight from here."""
+    return templates.TemplateResponse(
+        http_request,
+        "outbox.html",
+        {
+            "emails": services.list_outbox(session, eng),
+            "engagements": services.list_engagements(session),
+            "filter_eng": eng,
+            "smtp": emailer.smtp_configured(),
+        },
+    )
+
+
+@app.get("/engagements/{engagement_id}/client-link", response_class=HTMLResponse)
+def client_link_view(http_request: HttpRequest, engagement_id: int, session: Session = Depends(get_session)):
+    eng = services.get_engagement(session, engagement_id)
+    token = services.active_token(session, engagement_id)
+    return templates.TemplateResponse(
+        http_request,
+        "partials/clientlink.html",
+        {"eng": eng, "token": token, "link": emailer.client_link_url(token.token) if token else None,
+         "tokens": services.list_tokens(session, engagement_id)},
+    )
+
+
+@app.post("/engagements/{engagement_id}/client-link/generate")
+def client_link_generate(
+    engagement_id: int, actor: str = Form(""), days: int = Form(services.TOKEN_DEFAULT_DAYS),
+    session: Session = Depends(get_session),
+):
+    token = services.create_client_token(session, engagement_id, actor, days=days)
+    return {"ok": True, "link": emailer.client_link_url(token.token)}
+
+
+@app.post("/engagements/{engagement_id}/client-link/resend")
+def client_link_resend(engagement_id: int, actor: str = Form(""), session: Session = Depends(get_session)):
+    mail = services.send_client_link(session, engagement_id, actor)
+    return {"ok": True, "email_id": mail.id, "status": mail.status, "to": mail.to_address}
+
+
+@app.post("/engagements/{engagement_id}/client-link/revoke")
+def client_link_revoke(
+    engagement_id: int, actor: str = Form(""), token_id: int = Form(...), session: Session = Depends(get_session)
+):
+    token = services.revoke_client_token(session, token_id, actor)
+    if token.engagement_id != engagement_id:
+        raise services.NotFoundError("That link is not part of this engagement.")
+    return {"ok": True}
+
+
+@app.get("/engagements/{engagement_id}/settings", response_class=HTMLResponse)
+def settings_view(http_request: HttpRequest, engagement_id: int, session: Session = Depends(get_session)):
+    eng = services.get_engagement(session, engagement_id)
+    return templates.TemplateResponse(
+        http_request, "partials/settings.html", {"eng": eng, "smtp": emailer.smtp_configured()}
+    )
+
+
+@app.post("/engagements/{engagement_id}/settings")
+def settings_save(
+    engagement_id: int,
+    client_email: str = Form(""),
+    partner_email: str = Form(""),
+    age_warn_days: str = Form(""),
+    age_escalate_days: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    eng = services.update_engagement_settings(
+        session, engagement_id, client_email=client_email, partner_email=partner_email,
+        age_warn_days=age_warn_days, age_escalate_days=age_escalate_days,
+    )
+    return {"ok": True, "warn": eng.age_warn_days, "escalate": eng.age_escalate_days}
+
+
+@app.post("/engagements/{engagement_id}/release")
+def release_selected(
+    engagement_id: int,
+    request_id: list[int] = Form([]),
+    actor: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    """Batch release: mark the ticked Drafted requests Sent together and email the client link."""
+    result = services.release_requests(session, engagement_id, request_id, actor)
+    return {
+        "ok": True,
+        "released": result["released"],
+        "email_id": result["email"].id,
+        "status": result["email"].status,
+        "to": result["email"].to_address,
+        "link": result["link"],
+    }
+
+
+@app.post("/engagements/{engagement_id}/escalate")
+def escalate(engagement_id: int, actor: str = Form(""), session: Session = Depends(get_session)):
+    result = services.escalate_to_partner(session, engagement_id, actor)
+    return {"ok": True, "refs": result["refs"], "email_id": result["email"].id, "status": result["email"].status}
+
+
+@app.get("/templates/manager", response_class=HTMLResponse)
+def template_manager(
+    http_request: HttpRequest,
+    etype: Optional[str] = Query(None, alias="type"),
+    version: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    chosen = etype if etype in ENGAGEMENT_TYPES else ENGAGEMENT_TYPES[0]
+    versions = services.template_versions(session, chosen)
+    if not versions:
+        raise services.NotFoundError(f"No template for '{chosen}'.")
+    shown = next((t for t in versions if t.version == version), versions[0])
+    return templates.TemplateResponse(
+        http_request,
+        "partials/templates_manager.html",
+        {"chosen": chosen, "versions": versions, "shown": shown, "latest": versions[0]},
+    )
+
+
+@app.post("/templates/publish")
+def template_publish(
+    etype: str = Form(..., alias="type"),
+    actor: str = Form(""),
+    note: str = Form(""),
+    item_id: list[int] = Form([]),
+    label: list[str] = Form([]),
+    session: Session = Depends(get_session),
+):
+    if len(item_id) != len(label):
+        raise services.LedgerError("The form was incomplete - reload the template manager and try again.")
+    tmpl = services.publish_template_version(session, etype, actor, dict(zip(item_id, label)), note)
+    return {"ok": True, "version": tmpl.version, "type": tmpl.engagement_type}
 
 
 @app.get("/health")

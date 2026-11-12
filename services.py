@@ -7,13 +7,14 @@ import hashlib
 import json
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+import emailer
 from conditions import (
     CRORE,
     PROFILE_FIELDS,
@@ -24,6 +25,9 @@ from conditions import (
 )
 from models import (
     Arrival,
+    Chase,
+    ClientToken,
+    OutboundEmail,
     REASON_CODE_ALIASES,
     Submission,
     SubmissionFile,
@@ -114,7 +118,7 @@ PAYLOAD_KEYS: dict[str, set[str]] = {
     E.SUBMITTED: {"submitted_by", "filename", "note"},
     E.UNDER_REVIEW: {"note"},
     E.ACCEPTED: {"note"},
-    E.REJECTED: {"detail", "note"},
+    E.REJECTED: {"detail", "note", "pages"},
     E.WAIVED: {"reason", "note"},
     E.NOT_APPLICABLE: {"reason", "note"},
     E.NOTE: {"note"},
@@ -221,7 +225,30 @@ def _insert_event(
     return ev
 
 
-def _build_payload(event_type: str, channel: Optional[str], raw: dict) -> tuple[Optional[str], dict]:
+def reason_message(code: str, req: Optional[Request], pages: Optional[str] = None) -> str:
+    """What the client is told for a rejection reason, with the request's own context filled in:
+    the period asked for, the client entity, the pages that are missing, the document wanted."""
+    label, base = REASON_CODES[code]
+    if req is None:
+        return base
+    pages = _clean(pages)
+    if code == "WRONG_PERIOD" and (req.period_from or req.period_to):
+        return f"{base} The period asked for is {_period_phrase(req.period_from, req.period_to)}."
+    if code == "WRONG_ENTITY":
+        return f"{base} The document needed is for {req.engagement.client_name}."
+    if code == "INCOMPLETE" and pages:
+        return f"Pages are missing: {pages}."
+    if code == "PASSWORD_PROTECTED":
+        return f"{base} Please send the password by a separate route (a call or a separate message), not with the file."
+    if code == "NOT_THE_DOCUMENT_ASKED_FOR":
+        wanted = req.document + (f" - {req.description}" if req.description else "")
+        return f"{base} What we need is: {wanted}"
+    return base
+
+
+def _build_payload(
+    event_type: str, channel: Optional[str], raw: dict, req: Optional[Request] = None
+) -> tuple[Optional[str], dict]:
     raw = {k: _clean(v) for k, v in (raw or {}).items()}
     channel = _clean(channel)
 
@@ -241,7 +268,8 @@ def _build_payload(event_type: str, channel: Optional[str], raw: dict) -> tuple[
         code = REASON_CODE_ALIASES.get(code, code)
         if code not in REASON_CODES:
             raise LedgerError("Rejecting needs one of the eight reason codes.")
-        label, client_message = REASON_CODES[code]
+        label, _base = REASON_CODES[code]
+        client_message = reason_message(code, req, raw.get("pages"))
         payload = {
             "reason_code": code,
             "reason_label": label,
@@ -371,6 +399,7 @@ def append_event(
     channel: Optional[str] = None,
     payload: Optional[dict] = None,
     at: Optional[datetime] = None,
+    deliver=None,
 ) -> list[RequestEvent]:
     """Validate a transition and append it (never update, never delete).
 
@@ -400,13 +429,23 @@ def append_event(
                 "A submission is awaiting review - use the Audit Review panel (Accept / Reject Document)."
             )
 
-        channel, clean_payload = _build_payload(event_type, channel, {**(payload or {})})
+        channel, clean_payload = _build_payload(event_type, channel, {**(payload or {})}, req)
         at = _aware(at)
 
         if event_type == E.REJECTED:
             appended = _reject_and_rerequest(session, req, actor, channel, clean_payload, at)
         else:
             appended = [_insert_event(session, req, event_type, actor, channel, clean_payload, at)]
+            if event_type == E.CHASED:
+                # Section 9 `chase` row alongside the append-only CHASED event, in the same transaction.
+                chase = Chase(
+                    request_id=req.id, event_id=appended[0].id, at=appended[0].at, channel=channel,
+                    by_whom=actor, template=clean_payload.get("template"),
+                )
+                session.add(chase)
+                session.flush()
+                if deliver is not None:
+                    deliver(req, appended[0], chase)
         session.commit()
         return appended
     except Exception:
@@ -615,6 +654,7 @@ def review_submission(
     reason_code: Optional[str] = None,
     note: Optional[str] = None,
     at: Optional[datetime] = None,
+    pages: Optional[str] = None,
 ) -> list[RequestEvent]:
     """Accept or reject a pending submission.
 
@@ -659,7 +699,10 @@ def review_submission(
             code = REASON_CODE_ALIASES.get(code, code)
             if code not in REASON_CODES:
                 raise LedgerError("Rejecting needs one of the eight reason codes.")
-            label, client_message = REASON_CODES[code]
+            label, _base = REASON_CODES[code]
+            client_message = reason_message(code, req, pages)
+            if _clean(pages):
+                base_payload["pages"] = _clean(pages)
             events = _reject_and_rerequest(
                 session, req, actor, None,
                 {"reason_code": code, "reason_label": label, "client_message": client_message, **base_payload},
@@ -945,13 +988,34 @@ def _evaluate_item(item: TemplateItem, profile: dict) -> tuple[bool, Optional[st
     return applies, ("Included: " if applies else "Suppressed: ") + reason
 
 
+def _generated_docs(session: Session, requests: list[Request]) -> dict[str, Request]:
+    """template-item wording -> the request raised from it, so an item republished in a newer
+    template version is still recognised as already generated."""
+    ids = {r.template_item_id for r in requests if r.template_item_id}
+    if not ids:
+        return {}
+    docs = {
+        i.id: i.document
+        for i in session.execute(select(TemplateItem).where(TemplateItem.id.in_(ids))).scalars()
+    }
+    out: dict[str, Request] = {}
+    for r in requests:
+        doc = docs.get(r.template_item_id)
+        if doc:
+            out.setdefault(doc, r)
+    return out
+
+
 def _match_existing(
-    item: TemplateItem, document: str, pf: Optional[date], pt: Optional[date], requests: list[Request]
+    item: TemplateItem, document: str, pf: Optional[date], pt: Optional[date], requests: list[Request],
+    generated: Optional[dict] = None,
 ) -> tuple[Optional[Request], Optional[str]]:
     """Is this item already covered in the engagement?
     'generated' - a request was already made from this very template item (any state);
     'live'      - an open request for the same document and period (duplicate prevention);
     'accepted'  - the same document and period is already accepted, so asking again is pointless."""
+    if generated and item.document in generated:
+        return generated[item.document], "generated"
     for r in requests:
         if r.template_item_id == item.id:
             return r, "generated"
@@ -984,6 +1048,7 @@ def build_requirement_list(
     requests = engagement_requests(session, engagement_id)
     prior = find_prior_engagement(session, eng)
     history = prior_fulfilment(session, prior) if (prior and carry_forward) else {}
+    gen = _generated_docs(session, requests)
 
     rows = []
     for item in tmpl.items:
@@ -1007,7 +1072,7 @@ def build_requirement_list(
         if not applies:
             row["status"] = "suppressed"
         else:
-            existing, kind = _match_existing(item, document, pf, pt, requests)
+            existing, kind = _match_existing(item, document, pf, pt, requests, gen)
             row["existing"], row["existing_kind"] = existing, kind
             row["status"] = "existing" if existing else "create"
             if carry_forward and prior and row["status"] == "create":
@@ -1139,7 +1204,7 @@ def generate_requests(
                 continue
 
             requests = engagement_requests(session, engagement_id)
-            existing, kind = _match_existing(item, document, pf, pt, requests)
+            existing, kind = _match_existing(item, document, pf, pt, requests, _generated_docs(session, requests))
             if existing:
                 result["existing"].append(_existing_summary(document, existing, kind))
                 continue
@@ -1214,11 +1279,12 @@ CHASE_TEMPLATES = [
 _CHASE_BY_KEY = {t["key"]: t for t in CHASE_TEMPLATES}
 
 
-def age_band(days: int) -> str:
-    """'crit' beyond 21 days, 'warn' beyond 14, else 'ok'."""
-    if days > AGE_CRIT_DAYS:
+def age_band(days: int, warn: int = AGE_WARN_DAYS, crit: int = AGE_CRIT_DAYS) -> str:
+    """'crit' (escalate to the partner) beyond `crit` days, 'warn' beyond `warn`, else 'ok'.
+    The thresholds are per engagement (defaults 14 / 21)."""
+    if days > crit:
         return "crit"
-    if days > AGE_WARN_DAYS:
+    if days > warn:
         return "warn"
     return "ok"
 
@@ -1256,10 +1322,14 @@ def record_chase(
     template: Optional[str] = None,
     note: Optional[str] = None,
     at: Optional[datetime] = None,
+    notify: bool = True,
 ) -> dict:
-    """Append a CHASED event (channel + template or short note). Goes through the same transition
-    engine as every other event, so a chase on a request that is not waiting on the client (or on a
-    closed engagement) is refused. Returns the event and the new chase count."""
+    """Record a chase: a CHASED event (append-only) plus the Section 9 `chase` row, in one
+    transaction. By Email the reminder is also sent to the engagement's client address with the
+    upload link (logged in the Outbox) and the chase is marked delivered; the client opening the link
+    later marks it opened. WhatsApp / Phone chases are made by hand, so they are recorded but never
+    "delivered" by the system. `notify=False` records an Email chase as delivered without sending
+    anything (used when loading historical demo data)."""
     channel = _clean(channel)
     if channel not in CHASE_CHANNELS:
         raise LedgerError(f"A chase goes by {', '.join(CHASE_CHANNELS[:-1])} or {CHASE_CHANNELS[-1]}.")
@@ -1275,16 +1345,68 @@ def record_chase(
     if len(note) > 1000:
         raise LedgerError("The chase note is too long (1000 characters maximum).")
     label = _CHASE_BY_KEY[template]["label"] if template else None
-    events = append_event(
-        session, request_id, E.CHASED, actor,
-        channel=channel, payload={"note": note, "template": label}, at=at,
-    )
+
+    deliver = None
+    if channel == "Email":
+        deliver = _email_chase_hook(session, note, actor) if notify else _delivered_hook
+    eng, document = req.engagement, req.document
+    try:
+        events = append_event(
+            session, request_id, E.CHASED, actor,
+            channel=channel, payload={"note": note, "template": label}, at=at, deliver=deliver,
+        )
+    except emailer.EmailDeliveryError as exc:
+        session.rollback()
+        emailer.record_failure(
+            session, kind="chase", to_address=eng.client_email or "", subject=f"Reminder: {document}",
+            body=note, created_by=actor, error=str(exc), engagement_id=eng.id,
+        )
+        raise LedgerError(f"{exc} The chase was not recorded.") from exc
     req = get_request(session, request_id)
-    return {"event": events[0], "chase_count": req.chase_count, "request": req}
+    chase = session.execute(select(Chase).where(Chase.event_id == events[0].id)).scalar_one()
+    return {
+        "event": events[0],
+        "chase": chase,
+        "chase_count": req.chase_count,
+        "request": req,
+        "emailed": chase.email_id is not None,
+        "no_client_email": channel == "Email" and notify and not eng.client_email,
+    }
+
+
+def _delivered_hook(req: Request, ev: RequestEvent, chase: Chase) -> None:
+    chase.delivered = True
+    chase.delivered_at = ev.at
+
+
+def _email_chase_hook(session: Session, note: str, actor: str):
+    """Email the reminder with the client link, inside the chase's transaction."""
+
+    def hook(req: Request, ev: RequestEvent, chase: Chase) -> None:
+        eng = req.engagement
+        if not eng.client_email:
+            return  # nobody to email: the chase is recorded, but not delivered
+        token = _ensure_token(session, eng, actor)
+        body = (
+            f"{note}\n\n"
+            f"Document: {req.document} ({req.ref})\n"
+            f"Period: {_period_phrase(req.period_from, req.period_to)}\n"
+            f"Asked of: {req.owner_person}\n\n"
+            f"Upload it here - no login or password needed:\n{emailer.client_link_url(token.token)}\n"
+        )
+        mail = emailer.dispatch(
+            session, kind="chase", to_address=eng.client_email, subject=f"Reminder: {req.document}",
+            body=body, created_by=actor, engagement_id=eng.id, request_id=req.id, token_id=token.id,
+        )
+        chase.delivered = True
+        chase.delivered_at = mail.created_at
+        chase.email_id = mail.id
+
+    return hook
 
 
 # ---- the board -------------------------------------------------------------------------------
-def _board_row(req: Request, now: datetime) -> dict:
+def _board_row(req: Request, now: datetime, warn: int = AGE_WARN_DAYS, crit: int = AGE_CRIT_DAYS) -> dict:
     age = req.age_days(now)
     chases = [ev for ev in req.events if ev.event_type == E.CHASED]
     last_response = max(
@@ -1303,7 +1425,10 @@ def _board_row(req: Request, now: datetime) -> dict:
         "material": req.significance == "Material",
         "state": req.state,
         "age": age,
-        "band": age_band(age),
+        "band": age_band(age, warn, crit),
+        "escalated": any(
+            ev.event_type == E.NOTE and (ev.payload or {}).get("escalation") for ev in req.events
+        ),
         "chase_count": len(chases),
         "silent_chases": sum(1 for ev in chases if ev.seq > last_response),
         "last_chase": last_chase,
@@ -1318,51 +1443,63 @@ def outstanding_board(session: Session, engagement_id: int, cut: str = "age", no
 
     age          oldest first
     owner        grouped by the named person on the client side, busiest first
-    significance Material pinned above Routine (and never hidden by a filter)
+    significance oldest first within the two bands
     chase        most-chased first
+
+    In EVERY cut the Material-and-open requests are PINNED above everything else (`pinned`), in the
+    order of the cut, and the board's filter never hides them. `body` is what is left (routine).
+    Ageing thresholds are the engagement's own (default 14 / 21 days).
     """
     cut = cut if cut in dict(BOARD_CUTS) else "age"
     now = now or utcnow()
     eng = get_engagement(session, engagement_id)
+    warn, crit = eng.age_warn_days, eng.age_escalate_days
     requests = engagement_requests(session, engagement_id)
 
-    rows = [_board_row(r, now) for r in requests if r.state in CLIENT_SIDE_STATES]
+    rows = [_board_row(r, now, warn, crit) for r in requests if r.state in CLIENT_SIDE_STATES]
     by_age = sorted(rows, key=lambda b: (-b["age"], -b["chase_count"], b["id"]))
-    by_chase = sorted(rows, key=lambda b: (-b["chase_count"], -b["age"], b["id"]))
 
-    groups: list[dict] = []
-    if cut == "owner":
-        bucket: dict[str, dict] = {}
-        for b in by_age:
-            g = bucket.setdefault(
-                b["owner_name"].lower(),
-                {"name": b["owner_name"], "role": b["owner_role"], "rows": [], "material": 0,
-                 "chases": 0, "oldest": 0},
-            )
-            g["rows"].append(b)
-            g["material"] += 1 if b["material"] else 0
-            g["chases"] += b["chase_count"]
-            g["oldest"] = max(g["oldest"], b["age"])
-        groups = sorted(bucket.values(), key=lambda g: (-len(g["rows"]), -g["oldest"], g["name"]))
-        for g in groups:
-            g["band"] = age_band(g["oldest"])
+    # owner groups (over ALL rows, so a person's totals are honest even though material is pinned)
+    bucket: dict[str, dict] = {}
+    for b in by_age:
+        g = bucket.setdefault(
+            b["owner_name"].lower(),
+            {"name": b["owner_name"], "role": b["owner_role"], "rows": [], "total": 0, "material": 0,
+             "chases": 0, "oldest": 0},
+        )
+        g["total"] += 1
+        g["material"] += 1 if b["material"] else 0
+        g["chases"] += b["chase_count"]
+        g["oldest"] = max(g["oldest"], b["age"])
+    group_list = sorted(bucket.values(), key=lambda g: (-g["total"], -g["oldest"], g["name"]))
+    group_rank = {g["name"].lower(): i for i, g in enumerate(group_list)}
+    for g in group_list:
+        g["band"] = age_band(g["oldest"], warn, crit)
 
     if cut == "chase":
-        ordered = by_chase
+        ordered = sorted(rows, key=lambda b: (-b["chase_count"], -b["age"], b["id"]))
     elif cut == "owner":
-        ordered = [b for g in groups for b in g["rows"]]
-    elif cut == "significance":
-        ordered = [b for b in by_age if b["material"]] + [b for b in by_age if not b["material"]]
+        ordered = sorted(rows, key=lambda b: (group_rank[b["owner_name"].lower()], -b["age"], b["id"]))
     else:
         ordered = by_age
 
+    pinned = [b for b in ordered if b["material"]]
+    body = [b for b in ordered if not b["material"]]
+    groups: list[dict] = []
+    if cut == "owner":
+        for g in group_list:
+            g["rows"] = [b for b in body if b["owner_name"].lower() == g["name"].lower()]
+            g["pinned_count"] = g["material"]
+            groups.append(g)
+
     summary = {
         "outstanding": len(rows),
-        "material": sum(1 for b in rows if b["material"]),
+        "material": len(pinned),
         "warn": sum(1 for b in rows if b["band"] == "warn"),
         "crit": sum(1 for b in rows if b["band"] == "crit"),
+        "to_escalate": sum(1 for b in rows if b["band"] == "crit" and not b["escalated"]),
         "chased_3plus": sum(1 for b in rows if b["chase_count"] >= 3),
-        "owners": len({b["owner_name"].lower() for b in rows}),
+        "owners": len(bucket),
         "with_audit_team": sum(1 for r in requests if r.state in ("Submitted", "Under review")),
         "not_sent": sum(1 for r in requests if r.state == "Drafted"),
     }
@@ -1370,11 +1507,16 @@ def outstanding_board(session: Session, engagement_id: int, cut: str = "age", no
         "engagement": eng,
         "cut": cut,
         "cuts": BOARD_CUTS,
-        "rows": ordered,
+        "rows": pinned + body,
+        "pinned": pinned,
+        "body": body,
         "groups": groups,
         "material_rows": [b for b in by_age if b["material"]],
         "routine_rows": [b for b in by_age if not b["material"]],
         "summary": summary,
+        "warn": warn,
+        "crit": crit,
+        "partner_email": eng.partner_email,
         "now": now,
     }
 
@@ -1400,6 +1542,14 @@ def thread_fingerprint(req: Request) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def chases_by_event(session: Session, request_id: int) -> dict:
+    """event id -> its `chase` row (delivered / opened flags), for the thread views."""
+    return {
+        c.event_id: c
+        for c in session.execute(select(Chase).where(Chase.request_id == request_id)).scalars()
+    }
+
+
 def carried_from_request(session: Session, req: Request) -> Optional[Request]:
     return session.get(Request, req.carried_from_request_id) if req.carried_from_request_id else None
 
@@ -1416,6 +1566,7 @@ def export_context(session: Session, engagement_id: int, ref: str) -> dict:
         "carried_from": carried_from_request(session, req),
         "carried_note": (drafted.payload or {}).get("carried_forward") if drafted else None,
         "arrival_total": sum(len(f.arrivals) for sub in req.submissions for f in sub.files),
+        "chases": chases_by_event(session, req.id),
         "now": utcnow(),
     }
 
@@ -1710,3 +1861,465 @@ def sa580_csv(report: dict) -> str:
         w.writerow([i, x["ref"], x["document"], x["period"], x["owner"], x["significance"],
                     x["requested_on"].date().isoformat(), x["chases"], x["attempts"], x["frozen_from"] or ""])
     return buf.getvalue()
+
+
+# ============================================================================================
+# Pass 1 completion - settings, tokenised client link, batch release, escalation, outbox,
+# template manager
+# ============================================================================================
+CLIENT_ACTOR = "Client (tokenised link)"
+TOKEN_DEFAULT_DAYS = 30
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class TokenError(LedgerError):
+    """The client link cannot be used. `reason` is invalid / revoked / expired / closed."""
+
+    def __init__(self, reason: str, message: str):
+        self.reason = reason
+        super().__init__(message)
+
+
+# ---- engagement settings ---------------------------------------------------------------------
+def _valid_email(value: Optional[str], label: str) -> Optional[str]:
+    value = _clean(value)
+    if value and not _EMAIL_RE.match(value):
+        raise LedgerError(f"'{value}' is not a valid email address ({label}).")
+    return value.lower() if value else None
+
+
+def update_engagement_settings(
+    session: Session,
+    engagement_id: int,
+    *,
+    client_email: Optional[str] = None,
+    partner_email: Optional[str] = None,
+    age_warn_days: Optional[int] = None,
+    age_escalate_days: Optional[int] = None,
+) -> Engagement:
+    """Who the client link and reminders are emailed to, who escalations go to, and the ageing
+    thresholds (amber warning / partner escalation, in days outstanding)."""
+    client_email = _valid_email(client_email, "client")
+    partner_email = _valid_email(partner_email, "partner")
+    try:
+        warn = int(age_warn_days if age_warn_days not in (None, "") else AGE_WARN_DAYS)
+        crit = int(age_escalate_days if age_escalate_days not in (None, "") else AGE_CRIT_DAYS)
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("The ageing thresholds must be whole numbers of days.") from exc
+    if not 1 <= warn < crit <= 365:
+        raise LedgerError("The warning threshold must be at least 1 day and less than the escalation threshold (365 at most).")
+    try:
+        eng = _lock_engagement(session, engagement_id)
+        if eng.status != "Active":
+            raise LedgerError("This engagement is closed; its settings are frozen.")
+        eng.client_email = client_email
+        eng.partner_email = partner_email
+        eng.age_warn_days = warn
+        eng.age_escalate_days = crit
+        session.commit()
+        return eng
+    except Exception:
+        session.rollback()
+        raise
+
+
+# ---- tokenised client link -------------------------------------------------------------------
+def _ensure_token(session: Session, eng: Engagement, actor: str, days: int = TOKEN_DEFAULT_DAYS) -> ClientToken:
+    """The engagement's live link, creating one if there is none. Flushes, never commits."""
+    now = utcnow()
+    live = session.execute(
+        select(ClientToken)
+        .where(ClientToken.engagement_id == eng.id, ClientToken.revoked_at.is_(None), ClientToken.expires_at > now)
+        .order_by(ClientToken.id.desc())
+    ).scalars().first()
+    if live:
+        return live
+    token = ClientToken(engagement_id=eng.id, expires_at=now + timedelta(days=days), created_by=actor, created_at=now)
+    session.add(token)
+    session.flush()
+    return token
+
+
+def active_token(session: Session, engagement_id: int) -> Optional[ClientToken]:
+    now = utcnow()
+    return session.execute(
+        select(ClientToken)
+        .where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None), ClientToken.expires_at > now)
+        .order_by(ClientToken.id.desc())
+    ).scalars().first()
+
+
+def list_tokens(session: Session, engagement_id: int) -> list[ClientToken]:
+    return list(
+        session.execute(
+            select(ClientToken).where(ClientToken.engagement_id == engagement_id).order_by(ClientToken.id.desc())
+        ).scalars()
+    )
+
+
+def create_client_token(
+    session: Session,
+    engagement_id: int,
+    actor: str,
+    *,
+    days: int = TOKEN_DEFAULT_DAYS,
+    expires_at: Optional[datetime] = None,
+) -> ClientToken:
+    """Generate a new link and withdraw the previous live one (one live link per engagement)."""
+    actor = _require_actor(actor)
+    try:
+        days = int(days)
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("The link's validity must be a whole number of days.") from exc
+    if not 1 <= days <= 180:
+        raise LedgerError("A link can be valid for 1 to 180 days.")
+    try:
+        eng = _lock_engagement(session, engagement_id)
+        if eng.status != "Active":
+            raise LedgerError("This engagement is closed; no client link can be issued.")
+        now = utcnow()
+        for old in session.execute(
+            select(ClientToken).where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None))
+        ).scalars():
+            old.revoked_at = now
+        token = ClientToken(
+            engagement_id=engagement_id, created_by=actor, created_at=now,
+            expires_at=expires_at or (now + timedelta(days=days)),
+        )
+        session.add(token)
+        session.commit()
+        return token
+    except Exception:
+        session.rollback()
+        raise
+
+
+def revoke_client_token(session: Session, token_id: int, actor: str) -> ClientToken:
+    _require_actor(actor)
+    try:
+        token = session.get(ClientToken, token_id)
+        if token is None:
+            raise NotFoundError("That link does not exist.")
+        if token.revoked_at is None:
+            token.revoked_at = utcnow()
+        session.commit()
+        return token
+    except Exception:
+        session.rollback()
+        raise
+
+
+def resolve_token(session: Session, token_str: str) -> tuple[ClientToken, Engagement]:
+    """The link and its engagement, or a TokenError saying why it cannot be used."""
+    token = session.execute(select(ClientToken).where(ClientToken.token == (token_str or ""))).scalar_one_or_none()
+    if token is None:
+        raise TokenError("invalid", "This link is not valid. Please check you opened the whole link, or ask us to send it again.")
+    status = token.status()
+    if status == "revoked":
+        raise TokenError("revoked", "This link has been withdrawn. Please ask us for a new one.")
+    if status == "expired":
+        raise TokenError("expired", "This link has expired. Please ask us to send a fresh one.")
+    eng = session.get(Engagement, token.engagement_id)
+    if eng is None or eng.status != "Active":
+        raise TokenError("closed", "This engagement has been closed, so documents can no longer be received through this link.")
+    return token, eng
+
+
+def open_client_link(session: Session, token_str: str) -> dict:
+    """The client opened the link: every Sent request in the engagement becomes Acknowledged (an
+    ACKNOWLEDGED event each - "seen" is a different fact from "not seen"), and every chase that was
+    waiting to be opened is marked opened. Repeat opens change nothing."""
+    token, eng = resolve_token(session, token_str)
+    acknowledged = []
+    for req in engagement_requests(session, eng.id):
+        if req.state == "Sent":
+            append_event(
+                session, req.id, E.ACKNOWLEDGED, CLIENT_ACTOR, channel="Tokenised link",
+                payload={"note": "The client opened the upload link."},
+            )
+            acknowledged.append(req.ref)
+    now = utcnow()
+    opened = 0
+    try:
+        pending = session.execute(
+            select(Chase).join(Request, Request.id == Chase.request_id)
+            .where(Request.engagement_id == eng.id, Chase.opened.is_(False))
+        ).scalars().all()
+        for chase in pending:
+            chase.opened = True
+            chase.opened_at = now
+            opened += 1
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return {"token": token, "engagement": eng, "acknowledged": acknowledged, "chases_opened": opened}
+
+
+def client_view(session: Session, eng: Engagement) -> dict:
+    """What the client page shows: open requests in priority order, plainly worded, with the reason
+    for any earlier rejection; and what has already been received."""
+    open_rows, received = [], []
+    for req in sorted(engagement_requests(session, eng.id), key=lambda r: (r.priority, r.id)):
+        state = req.state
+        if state in SUBMITTABLE_STATES:
+            rejected = next((ev for ev in reversed(req.events) if ev.event_type == E.REJECTED), None)
+            open_rows.append({
+                "id": req.id,
+                "ref": req.ref,
+                "label": req.description or req.document,
+                "document": req.document,
+                "period": _period_phrase(req.period_from, req.period_to),
+                "owner": req.owner_person,
+                "attempt": req.attempt_count,
+                "state": state,
+                "rejection": (
+                    {"message": (rejected.payload or {}).get("client_message"),
+                     "detail": (rejected.payload or {}).get("detail") or (rejected.payload or {}).get("note")}
+                    if rejected else None
+                ),
+            })
+        elif state in ("Submitted", "Under review"):
+            received.append({"ref": req.ref, "document": req.document})
+    return {"open": open_rows, "received": received}
+
+
+def client_upload(
+    session: Session,
+    token_str: str,
+    request_id: int,
+    files: list[tuple[str, bytes]],
+    submitted_by: Optional[str] = None,
+) -> dict:
+    """A client upload through the link: no account, no password. The token is the only credential
+    and it only reaches requests of its own engagement."""
+    token, eng = resolve_token(session, token_str)
+    req = session.get(Request, request_id)
+    if req is None or req.engagement_id != eng.id:
+        raise NotFoundError("That request is not part of this link.")
+    name = _clean(submitted_by)
+    result = record_submission(
+        session, request_id, f"{name} (client)" if name else CLIENT_ACTOR, files,
+        channel="Tokenised link", submitted_by=name or req.owner_person,
+    )
+    return result
+
+
+# ---- batch release -----------------------------------------------------------------------------
+def _request_lines(reqs: list[Request]) -> str:
+    lines = []
+    for i, r in enumerate(sorted(reqs, key=lambda r: (r.priority, r.id)), start=1):
+        lines.append(f"  {i}. {r.document} - {_period_phrase(r.period_from, r.period_to)} (for {r.owner_person})")
+    return "\n".join(lines)
+
+
+def release_requests(session: Session, engagement_id: int, request_ids: list[int], actor: str) -> dict:
+    """Release several Drafted requests to the client together. In ONE transaction: a SENT event for
+    each (channel Email), the engagement's client link is created if needed, and one email listing
+    the requests with the link is sent (or logged in the Outbox). If any request is not Drafted, or
+    the email cannot be sent, nothing is released."""
+    actor = _require_actor(actor)
+    ids = list(dict.fromkeys(int(i) for i in request_ids))
+    if not ids:
+        raise LedgerError("Tick at least one Drafted request to release.")
+    mail_args = {}
+    try:
+        eng = _lock_engagement(session, engagement_id)
+        if eng.status != "Active":
+            raise LedgerError("This engagement is closed; nothing can be released.")
+        if not eng.client_email:
+            raise LedgerError("Set the client's email address first (Settings) - the release email goes there.")
+        reqs, problems = [], []
+        for rid in ids:
+            req = _lock_request(session, rid)
+            if req.engagement_id != engagement_id:
+                problems.append(f"request {rid} is not in this engagement")
+            elif req.state != "Drafted":
+                problems.append(f"{req.ref} is {req.state}, not Drafted")
+            else:
+                reqs.append(req)
+        if problems:
+            raise LedgerError("Nothing was released: " + "; ".join(problems) + ".")
+
+        token = _ensure_token(session, eng, actor)
+        at = utcnow()
+        for req in reqs:
+            _insert_event(session, req, E.SENT, actor, "Email",
+                          {"note": f"Released to the client by email ({eng.client_email}) with the upload link."}, at)
+        body = (
+            f"Dear {eng.client_name} team,\n\n"
+            f"We have released {len(reqs)} document request{'s' if len(reqs) != 1 else ''} for {eng.name}. "
+            f"Please upload them using the link below - no login or password is needed, and it works "
+            f"from a phone.\n\n{emailer.client_link_url(token.token)}\n\n"
+            f"The link is valid until {token.expires_at.strftime('%d %B %Y')}.\n\n"
+            f"Requests, in the order we would like them:\n{_request_lines(reqs)}\n\n"
+            f"Thank you,\n{actor}\n"
+        )
+        subject = f"{len(reqs)} document request{'s' if len(reqs) != 1 else ''} - {eng.name}"
+        mail_args = dict(kind="request_batch", to_address=eng.client_email, subject=subject, body=body,
+                         created_by=actor, engagement_id=eng.id, token_id=token.id)
+        mail = emailer.dispatch(session, **mail_args)
+        session.commit()
+        return {"released": [r.ref for r in reqs], "email": mail, "token": token,
+                "link": emailer.client_link_url(token.token)}
+    except emailer.EmailDeliveryError as exc:
+        session.rollback()
+        emailer.record_failure(session, error=str(exc), **{k: v for k, v in mail_args.items() if k != "token_id"})
+        raise LedgerError(f"{exc} Nothing was released.") from exc
+    except Exception:
+        session.rollback()
+        raise
+
+
+def send_client_link(session: Session, engagement_id: int, actor: str) -> OutboundEmail:
+    """(Re-)send the engagement's live link, with the list of requests currently waiting on the
+    client, to the client's email address."""
+    actor = _require_actor(actor)
+    eng = get_engagement(session, engagement_id)
+    if eng.status != "Active":
+        raise LedgerError("This engagement is closed; no client link can be sent.")
+    if not eng.client_email:
+        raise LedgerError("Set the client's email address first (Settings).")
+    token = active_token(session, engagement_id)
+    if token is None:
+        raise LedgerError("There is no live link - generate one first.")
+    waiting = [r for r in engagement_requests(session, engagement_id) if r.state in SUBMITTABLE_STATES]
+    body = (
+        f"Dear {eng.client_name} team,\n\n"
+        f"Here is your upload link for {eng.name}. No login or password is needed.\n\n"
+        f"{emailer.client_link_url(token.token)}\n\n"
+        f"It is valid until {token.expires_at.strftime('%d %B %Y')}.\n\n"
+        + (f"Still waiting on:\n{_request_lines(waiting)}\n\n" if waiting else "")
+        + f"Thank you,\n{actor}\n"
+    )
+    args = dict(kind="client_link", to_address=eng.client_email, subject=f"Your upload link - {eng.name}",
+                body=body, created_by=actor, engagement_id=eng.id, token_id=token.id)
+    try:
+        mail = emailer.dispatch(session, **args)
+        session.commit()
+        return mail
+    except emailer.EmailDeliveryError as exc:
+        session.rollback()
+        emailer.record_failure(session, error=str(exc), **{k: v for k, v in args.items() if k != "token_id"})
+        raise LedgerError(str(exc)) from exc
+
+
+# ---- partner escalation --------------------------------------------------------------------------
+def escalate_to_partner(session: Session, engagement_id: int, actor: str) -> dict:
+    """Email the partner one digest of everything past the engagement's escalation threshold that has
+    not been escalated yet, and record a NOTE ("Escalated to the partner") on each request."""
+    actor = _require_actor(actor)
+    board = outstanding_board(session, engagement_id, "age")
+    eng = board["engagement"]
+    if eng.status != "Active":
+        raise LedgerError("This engagement is closed.")
+    if not eng.partner_email:
+        raise LedgerError("Set the partner's email address first (Settings).")
+    due = [b for b in board["rows"] if b["band"] == "crit" and not b["escalated"]]
+    if not due:
+        raise LedgerError(f"Nothing is past the {eng.age_escalate_days}-day escalation threshold, or it has all been escalated already.")
+    lines = [
+        f"  {b['ref']}  {b['document']} - {b['age']} days - {b['chase_count']} chase{'s' if b['chase_count'] != 1 else ''}"
+        f" - held by {b['owner']}{' [MATERIAL]' if b['material'] else ''}"
+        for b in due
+    ]
+    body = (
+        f"{eng.name}: {len(due)} request{'s are' if len(due) != 1 else ' is'} past the "
+        f"{eng.age_escalate_days}-day escalation threshold.\n\n" + "\n".join(lines) +
+        f"\n\nEscalated by {actor}.\n"
+    )
+    args = dict(kind="escalation", to_address=eng.partner_email,
+                subject=f"Escalation: {len(due)} overdue request{'s' if len(due) != 1 else ''} - {eng.name}",
+                body=body, created_by=actor, engagement_id=eng.id)
+    try:
+        at = utcnow()
+        for b in due:
+            req = _lock_request(session, b["id"])
+            _insert_event(session, req, E.NOTE, actor, None,
+                          {"note": f"Escalated to the partner: {b['age']} days outstanding "
+                                   f"(threshold {eng.age_escalate_days}).", "escalation": eng.partner_email}, at)
+        mail = emailer.dispatch(session, **args)
+        session.commit()
+        return {"refs": [b["ref"] for b in due], "email": mail}
+    except emailer.EmailDeliveryError as exc:
+        session.rollback()
+        emailer.record_failure(session, error=str(exc), **args)
+        raise LedgerError(f"{exc} Nothing was escalated.") from exc
+    except Exception:
+        session.rollback()
+        raise
+
+
+# ---- outbox ------------------------------------------------------------------------------------------
+def list_outbox(session: Session, engagement_id: Optional[int] = None, limit: int = 200) -> list[OutboundEmail]:
+    stmt = select(OutboundEmail).order_by(OutboundEmail.id.desc()).limit(limit)
+    if engagement_id:
+        stmt = stmt.where(OutboundEmail.engagement_id == engagement_id)
+    return list(session.execute(stmt).scalars())
+
+
+# ---- template manager: edit client-facing labels, publish a new immutable version --------------------
+def template_versions(session: Session, engagement_type: str) -> list[RequestTemplate]:
+    return list(
+        session.execute(
+            select(RequestTemplate)
+            .where(RequestTemplate.engagement_type == engagement_type)
+            .options(selectinload(RequestTemplate.items))
+            .order_by(RequestTemplate.version.desc())
+        ).scalars()
+    )
+
+
+def publish_template_version(
+    session: Session,
+    engagement_type: str,
+    actor: str,
+    label_edits: dict[int, Optional[str]],
+    note: Optional[str] = None,
+) -> RequestTemplate:
+    """Publish version N+1 of a template with new client-facing labels (`label_text`). Every other
+    field is copied as it was. Earlier versions are never touched, so engagements that already used
+    them keep the wording they were asked in. `label_edits` maps template-item id -> new label."""
+    actor = _require_actor(actor)
+    if engagement_type not in ENGAGEMENT_TYPES:
+        raise LedgerError(f"Unknown engagement type '{engagement_type}'.")
+    try:
+        # Lock the current latest version so two people publishing at once get v2 and v3, not two v2s.
+        latest_id = session.execute(
+            select(RequestTemplate.id)
+            .where(RequestTemplate.engagement_type == engagement_type)
+            .order_by(RequestTemplate.version.desc()).limit(1).with_for_update()
+        ).scalar_one_or_none()
+        if latest_id is None:
+            raise NotFoundError(f"No requirement-list template for '{engagement_type}'.")
+        latest = get_template(session, engagement_type)
+        new_items, changed = [], 0
+        for item in latest.items:
+            label = item.label_text
+            if item.id in label_edits:
+                edited = _clean(label_edits[item.id])
+                if edited and len(edited) > 2000:
+                    raise LedgerError(f"The label for '{item.document}' is too long (2000 characters maximum).")
+                if edited != _clean(item.label_text):
+                    label, changed = edited, changed + 1
+            new_items.append(
+                TemplateItem(
+                    position=item.position, document=item.document, description=item.description,
+                    label_text=label, condition_expr=item.condition_expr,
+                    significance_default=item.significance_default, priority_default=item.priority_default,
+                    period_mode=item.period_mode,
+                )
+            )
+        if not changed:
+            raise LedgerError("No label was changed - there is nothing to publish.")
+        tmpl = RequestTemplate(
+            engagement_type=engagement_type, version=latest.version + 1, title=latest.title,
+            published_by=actor, change_note=_clean(note) or f"{changed} label{'s' if changed != 1 else ''} edited",
+        )
+        tmpl.items.extend(new_items)
+        session.add(tmpl)
+        session.commit()
+        return tmpl
+    except Exception:
+        session.rollback()
+        raise

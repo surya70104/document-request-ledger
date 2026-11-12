@@ -173,7 +173,7 @@ def top_up_board_demo(session, eng) -> int:
         for days_ago, channel in chases:
             services.record_chase(
                 session, req.id, SENIOR, channel,
-                template="gentle" if days_ago > 10 else "escalate", at=when(days_ago, 11),
+                template="gentle" if days_ago > 10 else "escalate", at=when(days_ago, 11), notify=False,
             )
         made += 1
     return made
@@ -234,7 +234,9 @@ def seed_prior_year(session) -> bool:
         )
         services.append_event(session, req.id, E.SENT, MANAGER, channel="Email", at=when(sent_ago, 9, 30))
         for days_ago, channel in chases:
-            services.record_chase(session, req.id, SENIOR, channel, template="gentle", at=when(days_ago, 11))
+            services.record_chase(
+                session, req.id, SENIOR, channel, template="gentle", at=when(days_ago, 11), notify=False
+            )
         last = min([sent_ago] + [d for d, _ in chases])
 
         def upload(days_ago, tag):
@@ -405,13 +407,56 @@ def seed() -> None:
         _stage4_topup(session, eng)
 
 
+DRAFT_DEMO = [
+    ("Insurance policies and renewal receipts",
+     "Current insurance schedule with the renewal receipts for the year.", "Routine", 3, KARTHIK),
+    ("Internal control questionnaire - completed",
+     "The completed questionnaire for the finance and operations teams.", "Routine", 3, ANITA),
+]
+
+
+def _pass1_topup(session, eng) -> None:
+    """Pass 1 completion demo: the client's and partner's email addresses, a live client link (so
+    /c/<token> can be tried straight away) and two Drafted requests to try 'Release selected'."""
+    if not eng.client_email and eng.status == "Active":
+        services.update_engagement_settings(
+            session, eng.id, client_email="accounts@acmetech.example", partner_email="partner@oakaudit.example",
+            age_warn_days=eng.age_warn_days, age_escalate_days=eng.age_escalate_days,
+        )
+        print("[seed] set demo client / partner email addresses (change them under Settings)")
+    have = {services._normalise_document(r.document) for r in services.engagement_requests(session, eng.id)}
+    added = 0
+    for document, description, significance, priority, owner in DRAFT_DEMO:
+        if services._normalise_document(document) in have:
+            continue
+        try:
+            services.create_request(
+                session, engagement_id=eng.id, document=document, description=description,
+                period_from=eng.period_from, period_to=eng.period_to, significance=significance,
+                priority=priority, owner_person=owner, actor=SENIOR,
+            )
+            added += 1
+        except services.DuplicateRequestError:
+            pass
+    if added:
+        print(f"[seed] added {added} Drafted request(s) to try 'Release selected (Send)'")
+    if eng.status == "Active":
+        token = services.active_token(session, eng.id) or services.create_client_token(session, eng.id, MANAGER)
+        import emailer
+        print(f"[seed] client upload link: {emailer.client_link_url(token.token)}")
+
+
 def _stage4_topup(session, eng) -> None:
     """Outstanding requests for the board cuts, and the closed prior year for carry-forward."""
+    if eng.status != "Active":  # a closed engagement is read-only: nothing can be added to it
+        print(f"[seed] '{eng.name}' is closed - not adding demo requests to it")
+        return
     made = top_up_board_demo(session, eng)
     if made:
         print(f"[seed] added {made} outstanding request(s) for the Outstanding Board demo")
     if seed_prior_year(session):
         print(f"[seed] created the closed prior-year engagement '{PRIOR_NAME}' (for carry-forward)")
+    _pass1_topup(session, eng)
 
 
 if __name__ == "__main__":

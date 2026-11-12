@@ -158,10 +158,34 @@ _GUARD_DDL = [
         BEFORE UPDATE OR DELETE ON engagement
         FOR EACH ROW EXECUTE FUNCTION ledger_block_closed_engagement();
     """,
+    # Pass 1 completion: a chase row is never deleted and only its delivered / opened flags may
+    # change (false -> true).
+    """
+    CREATE OR REPLACE FUNCTION ledger_chase_guard() RETURNS trigger AS $$
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'chase rows cannot be deleted' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.request_id IS DISTINCT FROM OLD.request_id OR NEW.event_id IS DISTINCT FROM OLD.event_id
+           OR NEW.at IS DISTINCT FROM OLD.at OR NEW.channel IS DISTINCT FROM OLD.channel
+           OR NEW."by" IS DISTINCT FROM OLD."by" OR NEW.template IS DISTINCT FROM OLD.template
+           OR (OLD.delivered AND NOT NEW.delivered) OR (OLD.opened AND NOT NEW.opened) THEN
+            RAISE EXCEPTION 'a chase can only be marked delivered or opened' USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    "DROP TRIGGER IF EXISTS trg_chase_guard ON chase;",
+    """
+    CREATE TRIGGER trg_chase_guard
+        BEFORE UPDATE OR DELETE ON chase
+        FOR EACH ROW EXECUTE FUNCTION ledger_chase_guard();
+    """,
     # Stage 2: templates are versioned and immutable; suppression records are append-only.
     *[
         stmt
-        for table in ("request_template", "template_item", "request_suppression", "arrival")
+        for table in ("request_template", "template_item", "request_suppression", "arrival", "outbound_email")
         for stmt in (
             f"DROP TRIGGER IF EXISTS trg_{table}_immutable ON {table};",
             f"""
@@ -188,6 +212,19 @@ _MIGRATIONS = [
     "UPDATE engagement SET closed_at = COALESCE("
     "(SELECT max(e.at) FROM request_event e JOIN request r ON r.id = e.request_id WHERE r.engagement_id = engagement.id), "
     "CAST(report_date AS TIMESTAMPTZ), now()) WHERE status = 'Closed' AND closed_at IS NULL",
+    # Pass 1 completion: engagement settings (the chase / outbound_email / client_token tables are
+    # created by create_all).
+    "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS published_by VARCHAR(200)",
+    "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS change_note TEXT",
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS client_email VARCHAR(200)",
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS partner_email VARCHAR(200)",
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS age_warn_days INTEGER NOT NULL DEFAULT 14",
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS age_escalate_days INTEGER NOT NULL DEFAULT 21",
+    # Chases recorded before the chase table existed get a row each (delivery was not tracked then).
+    "INSERT INTO chase (request_id, event_id, at, channel, \"by\", template, delivered, opened) "
+    "SELECT e.request_id, e.id, e.at, COALESCE(e.channel, 'Manual'), e.actor, e.payload->>'template', FALSE, FALSE "
+    "FROM request_event e WHERE e.event_type = 'CHASED' "
+    "AND NOT EXISTS (SELECT 1 FROM chase c WHERE c.event_id = e.id)",
     "ALTER TABLE request_event DROP CONSTRAINT IF EXISTS ck_request_event_type",
     "ALTER TABLE request_event ADD CONSTRAINT ck_request_event_type CHECK (event_type IN ({event_types}))",
 ]

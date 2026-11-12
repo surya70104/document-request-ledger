@@ -122,6 +122,8 @@
             {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
             {% set items = payload_items(ev) %}
             {% if items %}<div class="detail">{% for label, value in items %}<b>{{ label }}:</b> {{ value }}{{ ' · ' if not loop.last else '' }}{% endfor %}</div>{% endif %}
+            {% set ch = chases.get(ev.id) if chases else None %}
+            {% if ch %}<div class="detail"><b>Delivered:</b> {{ ch.delivered_at|ist('%d %b, %H:%M') if ch.delivered else 'not by the system' }} · <b>Opened by client:</b> {{ ch.opened_at|ist('%d %b, %H:%M') if ch.opened else 'not yet' }}</div>{% endif %}
           </td>
         </tr>
         {% endfor %}
