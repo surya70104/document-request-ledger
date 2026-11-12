@@ -837,3 +837,198 @@ def hashlib_sha256_of(text_value: str) -> str:
     import hashlib
 
     return hashlib.sha256(text_value.encode()).hexdigest()
+
+
+# ============================================================================================
+# Pass 2 / Screen 4 - the mobile client portal
+# ============================================================================================
+def _cards(html):
+    """The request ids rendered as cards on the client page, in order."""
+    return [int(i) for i in re.findall(r'class="req-card[^"]*" data-id="(\d+)"', html)]
+
+
+def test_client_page_shows_five_at_a_time_in_priority_order(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    spec = [("Item P3 routine", 3, "Routine"), ("Item P1 routine", 1, "Routine"), ("Item P1 material", 1, "Material"),
+            ("Item P2 material", 2, "Material"), ("Item P2 routine", 2, "Routine"), ("Item P4 routine", 4, "Routine"),
+            ("Item P5 routine", 5, "Routine")]
+    reqs = {doc: make_request(eng, doc, priority=p, significance=sig) for doc, p, sig in spec}
+    docs = {r.id: d for d, r in reqs.items()}
+    token = services.create_client_token(session, eng.id, "Priya").token
+
+    page = client.get(f"/c/{token}")
+    assert page.status_code == 200
+    cards = _cards(page.text)
+    assert len(cards) == 5, "7 items are open but only 5 are shown"
+    assert [docs[i] for i in cards] == ["Item P1 material", "Item P1 routine", "Item P2 material",
+                                         "Item P2 routine", "Item P3 routine"], "strict priority order, Material first within a priority"
+    assert "<b>5 of 7</b>" in page.text and "complete these to unlock the rest" in page.text
+    assert 'role="progressbar"' in page.text
+    assert "Item P4 routine" not in page.text and "Item P5 routine" not in page.text
+    assert 'capture="environment"' in page.text and "I don't have this" in page.text  # phone camera + escape hatch
+
+    # the locked items cannot be reached by guessing their ids
+    locked = reqs["Item P4 routine"].id
+    r = client.post(f"/c/{token}/requests/{locked}/upload", files={"files": ("x.pdf", b"x")})
+    assert r.status_code == 400 and "unlocks" in r.text
+    assert client.post(f"/c/{token}/requests/{locked}/unavailable", data={"reason": "none"}).status_code == 400
+
+    # finishing one shown item unlocks the next
+    ok = client.post(f"/c/{token}/requests/{reqs['Item P1 material'].id}/upload", files={"files": ("a.pdf", b"first")})
+    assert ok.status_code == 200
+    cards = _cards(client.get(f"/c/{token}").text)
+    assert len(cards) == 5 and docs[cards[-1]] == "Item P4 routine" and reqs["Item P1 material"].id not in cards
+    assert client.post(f"/c/{token}/requests/{locked}/upload", files={"files": ("y.pdf", b"y")}).status_code == 200
+
+    # a short queue shows no "unlock" message
+    small = make_engagement()
+    for i in range(3):
+        make_request(small, f"Small {i}", priority=i + 1)
+    page = client.get(f"/c/{services.create_client_token(session, small.id, 'P').token}")
+    assert len(_cards(page.text)) == 3 and "unlock the rest" not in page.text
+
+
+def test_owner_scoped_link_shows_and_acknowledges_only_that_owners_requests(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    meera = "Meera Shah (Finance Controller)"
+    m1 = make_request(eng, "Meera one", owner=meera, priority=1)
+    m2 = make_request(eng, "Meera two", owner=meera, priority=2)
+    ravi = make_request(eng, "Ravi one", owner="Ravi Menon (Accountant)")
+    draft = make_request(eng, "Meera draft", owner=meera, send=False)
+    services.record_chase(session, m2.id, "Arjun", "WhatsApp", note="nudge Meera")
+    services.record_chase(session, ravi.id, "Arjun", "WhatsApp", note="nudge Ravi")
+
+    assert services.engagement_owner_names(session, eng.id) == ["Meera Shah", "Ravi Menon"]
+    with pytest.raises(services.LedgerError, match="No request in this engagement"):
+        services.create_client_token(session, eng.id, "Priya", owner_person="Nobody Here")
+    whole = services.create_client_token(session, eng.id, "Priya")
+    scoped = services.create_client_token(session, eng.id, "Priya", owner_person="meera shah")
+    assert scoped.owner_person == "Meera Shah" and whole.owner_person is None
+    assert services.active_token(session, eng.id).id == whole.id, "the whole-engagement link is untouched"
+    assert services.active_token(session, eng.id, "Meera Shah").id == scoped.id
+    assert {t.id for t in services.live_tokens(session, eng.id)} == {whole.id, scoped.id}
+
+    page = client.get(f"/c/{scoped.token}")
+    assert page.status_code == 200 and "Hello Meera" in page.text
+    assert "Meera one" in page.text and "Meera two" in page.text
+    assert "Ravi one" not in page.text and "Meera draft" not in page.text
+    assert len(_cards(page.text)) == 2
+    assert states(session, eng) == {m1.ref: "Acknowledged", m2.ref: "Acknowledged", ravi.ref: "Sent", draft.ref: "Drafted"}
+    chases = {c.request_id: c.opened for c in session.execute(select(Chase)).scalars() if c.request_id in (m2.id, ravi.id)}
+    assert chases == {m2.id: True, ravi.id: False}, "only the chases on Meera's requests were opened"
+
+    # her link cannot reach anyone else's request
+    assert client.post(f"/c/{scoped.token}/requests/{ravi.id}/upload", files={"files": ("x.pdf", b"x")}).status_code == 404
+    assert client.post(f"/c/{scoped.token}/requests/{ravi.id}/unavailable", data={"reason": "not mine"}).status_code == 404
+    assert client.post(f"/c/{scoped.token}/requests/{m1.id}/upload", files={"files": ("m.pdf", b"m")}).status_code == 200
+
+    # the whole-engagement link still shows everything and acknowledges the rest
+    page = client.get(f"/c/{whole.token}")
+    assert "Ravi one" in page.text and "Meera two" in page.text
+    assert states(session, eng)[ravi.ref] == "Acknowledged"
+
+    # regenerating Meera's link withdraws only Meera's previous one
+    again = services.create_client_token(session, eng.id, "Priya", owner_person="Meera Shah")
+    assert client.get(f"/c/{scoped.token}").status_code == 410
+    assert client.get(f"/c/{whole.token}").status_code == 200 and client.get(f"/c/{again.token}").status_code == 200
+
+    page = client.get(f"/engagements/{eng.id}/client-link")
+    assert page.status_code == 200 and "Only Meera Shah" in page.text and "Whole engagement" in page.text
+
+
+def test_multi_page_upload_preserves_page_order_and_hashes(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    token = services.create_client_token(session, eng.id, "Priya").token
+    req = make_request(eng, "Twelve-page ledger")
+    pages = [("zebra.jpg", b"page one bytes"), ("apple.jpg", b"page two bytes"), ("mango.jpg", b"page three bytes")]
+
+    res = client.post(f"/c/{token}/requests/{req.id}/upload",
+                      files=[("files", (n, c, "image/jpeg")) for n, c in pages], data={"submitted_by": "Ravi Menon"})
+    assert res.status_code == 200 and res.json()["stored"] == 3
+    got = services.get_request(session, req.id)
+    assert len(got.submissions) == 1, "all the pages are ONE submission"
+    files = got.submissions[0].files
+    assert [(f.page_order, f.filename) for f in files] == [(1, "zebra.jpg"), (2, "apple.jpg"), (3, "mango.jpg")], \
+        "the order the client arranged, not alphabetical"
+    assert [f.content_hash for f in files] == [services.sha256_hex(c) for _, c in pages]
+    assert (services.UPLOAD_DIR / files[1].storage_path).read_bytes() == b"page two bytes"
+    assert got.submissions[0].channel == "Tokenised link" and got.state == "Submitted"
+
+    # reversing the order reverses the pages; a repeated photo is an arrival, not another page
+    other = make_request(eng, "Another ledger")
+    res = client.post(f"/c/{token}/requests/{other.id}/upload", files=[
+        ("files", ("c.jpg", b"CCC", "image/jpeg")), ("files", ("b.jpg", b"BBB", "image/jpeg")),
+        ("files", ("c-again.jpg", b"CCC", "image/jpeg")), ("files", ("a.jpg", b"AAA", "image/jpeg"))])
+    assert res.status_code == 200 and res.json()["stored"] == 3 and res.json()["repeats"][0]["count"] == 2
+    sub = services.get_request(session, other.id).submissions[0]
+    assert [(f.page_order, f.filename) for f in sub.files] == [(1, "c.jpg"), (2, "b.jpg"), (3, "a.jpg")]
+    assert len(sub.files[0].arrivals) == 1 and len(services.get_request(session, other.id).submissions) == 1
+
+
+def test_client_can_say_i_dont_have_this(session, engine_db, make_engagement, make_request, client):
+    eng = make_engagement()
+    asked = make_request(eng, "Rental agreements", priority=1)
+    other = make_request(eng, "Insurance schedule", priority=2)
+    token = services.create_client_token(session, eng.id, "Priya").token
+
+    for bad in ({"reason": ""}, {"reason": "no"}):
+        assert client.post(f"/c/{token}/requests/{asked.id}/unavailable", data=bad).status_code == 400
+    res = client.post(f"/c/{token}/requests/{asked.id}/unavailable",
+                      data={"reason": "Not applicable to our business", "submitted_by": "Ravi Menon"})
+    assert res.status_code == 200
+
+    req = services.get_request(session, asked.id)
+    ev = req.events[-1]
+    assert ev.event_type == "CLIENT_REPORTED_UNAVAILABLE"
+    assert ev.payload["reason"] == "Not applicable to our business"
+    assert ev.channel == "Tokenised link" and ev.actor == "Ravi Menon (client)"
+    assert req.state == "Sent", "it is information: the firm decides what happens to the request"
+    assert req.reported_unavailable.id == ev.id
+
+    # it leaves the client's queue and is listed as answered
+    page = client.get(f"/c/{token}")
+    assert _cards(page.text) == [other.id] and "You told us you don't have these" in page.text
+    assert "Not applicable to our business" in page.text and "1 of 2 done" in page.text
+    assert client.post(f"/c/{token}/requests/{asked.id}/upload", files={"files": ("x.pdf", b"x")}).status_code == 400
+
+    # the firm sees it on the dashboard row, the board and in the drawer
+    assert "Client says they don't have this" in client.get(f"/?eng={eng.id}").text
+    assert "Client says they" in client.get(f"/engagements/{eng.id}/board?cut=age").text
+    drawer = client.get(f"/requests/{asked.id}/trail")
+    assert 'id="unavailable-alert"' in drawer.text and "Not applicable to our business" in drawer.text
+    assert "Client reported unavailable" in drawer.text
+
+    # staff cannot forge it, the DB knows the type, and a later submission supersedes it
+    with pytest.raises(services.LedgerError):
+        services.append_event(session, asked.id, "CLIENT_REPORTED_UNAVAILABLE", "Staff", payload={"reason": "x"})
+    session.rollback()
+    with pytest.raises(DBAPIError):
+        with engine_db.begin() as conn:
+            conn.execute(text("INSERT INTO request_event (request_id, seq, event_type, actor, at, payload) "
+                              "VALUES (:i, 99, 'NOT_A_REAL_EVENT', 'x', now(), CAST('{}' AS jsonb))"), {"i": asked.id})
+    services.record_submission(session, asked.id, "Staff", [("found.pdf", b"found it")])
+    assert services.get_request(session, asked.id).reported_unavailable is None
+
+    # refused once the engagement is closed
+    services.close_engagement(session, eng.id, "Partner")
+    assert client.post(f"/c/{token}/requests/{other.id}/unavailable", data={"reason": "too late"}).status_code == 410
+
+
+def test_email_reminders_carry_the_owners_own_link(session, make_engagement, make_request):
+    eng = make_engagement(client_email="accounts@client.example")
+    meera = make_request(eng, "Meera's ledger", owner="Meera Shah (Finance Controller)")
+    ravi = make_request(eng, "Ravi's challans", owner="Ravi Menon (Accountant)")
+    whole = services.create_client_token(session, eng.id, "Priya")
+    scoped = services.create_client_token(session, eng.id, "Priya", owner_person="Meera Shah")
+
+    to_meera = services.record_chase(session, meera.id, "Arjun", "Email", template="gentle")
+    to_ravi = services.record_chase(session, ravi.id, "Arjun", "Email", template="gentle")
+    body = lambda res: session.get(OutboundEmail, res["chase"].email_id).body  # noqa: E731
+    assert f"/c/{scoped.token}" in body(to_meera) and f"/c/{whole.token}" not in body(to_meera)
+    assert f"/c/{whole.token}" in body(to_ravi) and f"/c/{scoped.token}" not in body(to_ravi)
+
+    mail = services.send_client_link(session, eng.id, "Priya", scoped.id)
+    assert "for Meera Shah" in mail.subject and "Meera's ledger" in mail.body and "Ravi's challans" not in mail.body
+    assert f"/c/{scoped.token}" in mail.body
+    whole_mail = services.send_client_link(session, eng.id, "Priya")
+    assert "Ravi's challans" in whole_mail.body and "Meera's ledger" in whole_mail.body

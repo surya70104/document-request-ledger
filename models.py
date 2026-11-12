@@ -53,6 +53,8 @@ class EventType:
     CHASED = "CHASED"
     NOTE = "NOTE"
     ARRIVAL = "ARRIVAL_RECORDED"  # identical content arrived again (matched on SHA-256)
+    # The client said "I don't have this" (with a reason). Information, not a state change.
+    CLIENT_UNAVAILABLE = "CLIENT_REPORTED_UNAVAILABLE"
 
 
 # The eleven lifecycle states, in lifecycle order.
@@ -89,6 +91,7 @@ EVENT_LABEL = {
     EventType.CHASED: "Chased",
     EventType.NOTE: "Note",
     EventType.ARRIVAL: "Identical content re-sent",
+    EventType.CLIENT_UNAVAILABLE: "Client reported unavailable",
 }
 
 ALL_EVENT_TYPES = list(EVENT_LABEL.keys())
@@ -322,6 +325,20 @@ class Request(Base):
         return None
 
     @property
+    def reported_unavailable(self) -> Optional["RequestEvent"]:
+        """The client's "I don't have this" event while it still stands: the request must be open,
+        and no later submission or re-request has superseded it. None otherwise."""
+        if not self.is_open:
+            return None
+        flag = None
+        for ev in self.events:
+            if ev.event_type == EventType.CLIENT_UNAVAILABLE:
+                flag = ev
+            elif flag is not None and ev.event_type in (EventType.SUBMITTED, EventType.RE_REQUESTED):
+                flag = None
+        return flag
+
+    @property
     def last_event(self) -> Optional["RequestEvent"]:
         return self.events[-1] if self.events else None
 
@@ -509,6 +526,8 @@ class ClientToken(Base):
         ForeignKey("engagement.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     token: Mapped[str] = mapped_column(String(80), nullable=False, unique=True, default=lambda: secrets.token_urlsafe(32))
+    # NULL = a link for the whole engagement; otherwise it reaches only this named client-side owner's requests.
+    owner_person: Mapped[Optional[str]] = mapped_column(String(200))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_by: Mapped[str] = mapped_column(String(200), nullable=False)

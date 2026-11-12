@@ -99,7 +99,7 @@ ALLOWED_NEXT: dict[str, set[str]] = {
 # Event types a caller may not append directly. SUBMITTED and ARRIVAL_RECORDED are written by
 # record_submission() (a submission always has a file); ACCEPTED/REJECTED of a pending submission
 # go through review_submission().
-SYSTEM_ONLY = {E.DRAFTED, E.RE_REQUESTED, E.UNFULFILLED, E.SUBMITTED, E.ARRIVAL}
+SYSTEM_ONLY = {E.DRAFTED, E.RE_REQUESTED, E.UNFULFILLED, E.SUBMITTED, E.ARRIVAL, E.CLIENT_UNAVAILABLE}
 
 # Display order for the action menu.
 ACTION_ORDER = [
@@ -1386,7 +1386,7 @@ def _email_chase_hook(session: Session, note: str, actor: str):
         eng = req.engagement
         if not eng.client_email:
             return  # nobody to email: the chase is recorded, but not delivered
-        token = _ensure_token(session, eng, actor)
+        token = _link_token_for(session, eng, req, actor)
         body = (
             f"{note}\n\n"
             f"Document: {req.document} ({req.ref})\n"
@@ -1426,6 +1426,7 @@ def _board_row(req: Request, now: datetime, warn: int = AGE_WARN_DAYS, crit: int
         "state": req.state,
         "age": age,
         "band": age_band(age, warn, crit),
+        "unavailable": req.reported_unavailable,
         "escalated": any(
             ev.event_type == E.NOTE and (ev.payload or {}).get("escalation") for ev in req.events
         ),
@@ -1869,6 +1870,7 @@ def sa580_csv(report: dict) -> str:
 # ============================================================================================
 CLIENT_ACTOR = "Client (tokenised link)"
 TOKEN_DEFAULT_DAYS = 30
+CLIENT_QUEUE_SIZE = 5  # the client sees this many open requests at a time
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -1924,29 +1926,76 @@ def update_engagement_settings(
 
 
 # ---- tokenised client link -------------------------------------------------------------------
-def _ensure_token(session: Session, eng: Engagement, actor: str, days: int = TOKEN_DEFAULT_DAYS) -> ClientToken:
-    """The engagement's live link, creating one if there is none. Flushes, never commits."""
+def owner_name_key(owner: Optional[str]) -> str:
+    """'Meera Shah (Finance Controller)' and 'meera shah' are the same named person."""
+    return owner_parts(owner or "")[0].strip().lower()
+
+
+def token_covers(token: ClientToken, req: Request) -> bool:
+    """A whole-engagement link covers every request; an owner-scoped link only that person's."""
+    return not token.owner_person or owner_name_key(token.owner_person) == owner_name_key(req.owner_person)
+
+
+def engagement_owner_names(session: Session, engagement_id: int) -> list[str]:
+    """The distinct named client-side owners in the engagement (role dropped), for scoped links."""
+    names: dict[str, str] = {}
+    for (owner,) in session.execute(
+        select(Request.owner_person).where(Request.engagement_id == engagement_id).distinct()
+    ):
+        name = owner_parts(owner)[0]
+        names.setdefault(name.lower(), name)
+    return sorted(names.values())
+
+
+def _live_tokens(session: Session, engagement_id: int) -> list[ClientToken]:
     now = utcnow()
-    live = session.execute(
-        select(ClientToken)
-        .where(ClientToken.engagement_id == eng.id, ClientToken.revoked_at.is_(None), ClientToken.expires_at > now)
-        .order_by(ClientToken.id.desc())
-    ).scalars().first()
-    if live:
-        return live
-    token = ClientToken(engagement_id=eng.id, expires_at=now + timedelta(days=days), created_by=actor, created_at=now)
+    return list(
+        session.execute(
+            select(ClientToken)
+            .where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None), ClientToken.expires_at > now)
+            .order_by(ClientToken.id.desc())
+        ).scalars()
+    )
+
+
+def live_tokens(session: Session, engagement_id: int) -> list[ClientToken]:
+    """Every live link of the engagement: the whole-engagement one and any owner-scoped ones."""
+    return _live_tokens(session, engagement_id)
+
+
+def _ensure_token(
+    session: Session, eng: Engagement, actor: str, days: int = TOKEN_DEFAULT_DAYS, owner: Optional[str] = None
+) -> ClientToken:
+    """The live link with this scope (whole engagement by default), creating one if there is none.
+    Flushes, never commits."""
+    for token in _live_tokens(session, eng.id):
+        if owner_name_key(token.owner_person) == owner_name_key(owner):
+            return token
+    now = utcnow()
+    token = ClientToken(
+        engagement_id=eng.id, expires_at=now + timedelta(days=days), created_by=actor, created_at=now,
+        owner_person=_clean(owner),
+    )
     session.add(token)
     session.flush()
     return token
 
 
-def active_token(session: Session, engagement_id: int) -> Optional[ClientToken]:
-    now = utcnow()
-    return session.execute(
-        select(ClientToken)
-        .where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None), ClientToken.expires_at > now)
-        .order_by(ClientToken.id.desc())
-    ).scalars().first()
+def _link_token_for(session: Session, eng: Engagement, req: Request, actor: str) -> ClientToken:
+    """The link to put in a reminder about this request: its owner's own link if one is live,
+    otherwise the engagement-wide one."""
+    for token in _live_tokens(session, eng.id):
+        if token.owner_person and token_covers(token, req):
+            return token
+    return _ensure_token(session, eng, actor)
+
+
+def active_token(session: Session, engagement_id: int, owner: Optional[str] = None) -> Optional[ClientToken]:
+    """The live link with the given scope (the whole-engagement link when `owner` is None)."""
+    for token in _live_tokens(session, engagement_id):
+        if owner_name_key(token.owner_person) == owner_name_key(owner):
+            return token
+    return None
 
 
 def list_tokens(session: Session, engagement_id: int) -> list[ClientToken]:
@@ -1964,8 +2013,10 @@ def create_client_token(
     *,
     days: int = TOKEN_DEFAULT_DAYS,
     expires_at: Optional[datetime] = None,
+    owner_person: Optional[str] = None,
 ) -> ClientToken:
-    """Generate a new link and withdraw the previous live one (one live link per engagement)."""
+    """Generate a link - for the whole engagement, or scoped to one named client-side owner - and
+    withdraw the previous live link OF THE SAME SCOPE (other scopes keep working)."""
     actor = _require_actor(actor)
     try:
         days = int(days)
@@ -1973,17 +2024,25 @@ def create_client_token(
         raise LedgerError("The link's validity must be a whole number of days.") from exc
     if not 1 <= days <= 180:
         raise LedgerError("A link can be valid for 1 to 180 days.")
+    owner = _clean(owner_person)
     try:
         eng = _lock_engagement(session, engagement_id)
         if eng.status != "Active":
             raise LedgerError("This engagement is closed; no client link can be issued.")
+        if owner:
+            known = {n.lower(): n for n in engagement_owner_names(session, engagement_id)}
+            canonical = known.get(owner_name_key(owner))
+            if canonical is None:
+                raise LedgerError(f"No request in this engagement is held by '{owner}'.")
+            owner = canonical
         now = utcnow()
         for old in session.execute(
             select(ClientToken).where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None))
         ).scalars():
-            old.revoked_at = now
+            if owner_name_key(old.owner_person) == owner_name_key(owner):
+                old.revoked_at = now
         token = ClientToken(
-            engagement_id=engagement_id, created_by=actor, created_at=now,
+            engagement_id=engagement_id, created_by=actor, created_at=now, owner_person=owner,
             expires_at=expires_at or (now + timedelta(days=days)),
         )
         session.add(token)
@@ -2026,12 +2085,16 @@ def resolve_token(session: Session, token_str: str) -> tuple[ClientToken, Engage
 
 
 def open_client_link(session: Session, token_str: str) -> dict:
-    """The client opened the link: every Sent request in the engagement becomes Acknowledged (an
-    ACKNOWLEDGED event each - "seen" is a different fact from "not seen"), and every chase that was
-    waiting to be opened is marked opened. Repeat opens change nothing."""
+    """The client opened the link: every Sent request the link covers becomes Acknowledged (an
+    ACKNOWLEDGED event each - "seen" is a different fact from "not seen"), and every chase on those
+    requests that was waiting to be opened is marked opened. An owner-scoped link touches only that
+    person's requests. Repeat opens change nothing."""
     token, eng = resolve_token(session, token_str)
-    acknowledged = []
+    acknowledged, covered_ids = [], set()
     for req in engagement_requests(session, eng.id):
+        if not token_covers(token, req):
+            continue
+        covered_ids.add(req.id)
         if req.state == "Sent":
             append_event(
                 session, req.id, E.ACKNOWLEDGED, CLIENT_ACTOR, channel="Tokenised link",
@@ -2046,9 +2109,10 @@ def open_client_link(session: Session, token_str: str) -> dict:
             .where(Request.engagement_id == eng.id, Chase.opened.is_(False))
         ).scalars().all()
         for chase in pending:
-            chase.opened = True
-            chase.opened_at = now
-            opened += 1
+            if chase.request_id in covered_ids:
+                chase.opened = True
+                chase.opened_at = now
+                opened += 1
         session.commit()
     except Exception:
         session.rollback()
@@ -2056,32 +2120,82 @@ def open_client_link(session: Session, token_str: str) -> dict:
     return {"token": token, "engagement": eng, "acknowledged": acknowledged, "chases_opened": opened}
 
 
-def client_view(session: Session, eng: Engagement) -> dict:
-    """What the client page shows: open requests in priority order, plainly worded, with the reason
-    for any earlier rejection; and what has already been received."""
-    open_rows, received = [], []
-    for req in sorted(engagement_requests(session, eng.id), key=lambda r: (r.priority, r.id)):
+def _client_buckets(session: Session, eng: Engagement, token: ClientToken):
+    """The link's requests split into: open (in the queue), received (submitted / under review) and
+    unavailable (the client said they do not have it). The queue is strictly priority order -
+    P1 first, and Material before Routine within a priority."""
+    open_, received, unavailable = [], [], []
+    for req in engagement_requests(session, eng.id):
+        if not token_covers(token, req):
+            continue
         state = req.state
         if state in SUBMITTABLE_STATES:
-            rejected = next((ev for ev in reversed(req.events) if ev.event_type == E.REJECTED), None)
-            open_rows.append({
-                "id": req.id,
-                "ref": req.ref,
-                "label": req.description or req.document,
-                "document": req.document,
-                "period": _period_phrase(req.period_from, req.period_to),
-                "owner": req.owner_person,
-                "attempt": req.attempt_count,
-                "state": state,
-                "rejection": (
-                    {"message": (rejected.payload or {}).get("client_message"),
-                     "detail": (rejected.payload or {}).get("detail") or (rejected.payload or {}).get("note")}
-                    if rejected else None
-                ),
-            })
+            (unavailable if req.reported_unavailable else open_).append(req)
         elif state in ("Submitted", "Under review"):
-            received.append({"ref": req.ref, "document": req.document})
-    return {"open": open_rows, "received": received}
+            received.append(req)
+    open_.sort(key=lambda r: (r.priority, 0 if r.significance == "Material" else 1, r.id))
+    return open_, received, unavailable
+
+
+def client_view(session: Session, eng: Engagement, token: ClientToken) -> dict:
+    """What the client page shows: at most CLIENT_QUEUE_SIZE open requests at a time, in priority
+    order and plainly worded, with the reason for any earlier rejection; what has been received;
+    and what the client said they do not have. Finishing the shown items unlocks the next ones."""
+    open_, received, unavailable = _client_buckets(session, eng, token)
+    shown = []
+    for req in open_[:CLIENT_QUEUE_SIZE]:
+        rejected = next((ev for ev in reversed(req.events) if ev.event_type == E.REJECTED), None)
+        shown.append({
+            "id": req.id,
+            "ref": req.ref,
+            "label": req.description or req.document,
+            "document": req.document,
+            "period": _period_phrase(req.period_from, req.period_to),
+            "owner": req.owner_person,
+            "priority": req.priority,
+            "material": req.significance == "Material",
+            "attempt": req.attempt_count,
+            "state": req.state,
+            "rejection": (
+                {"message": (rejected.payload or {}).get("client_message"),
+                 "detail": (rejected.payload or {}).get("detail") or (rejected.payload or {}).get("note")}
+                if rejected and req.state == "Re-requested" else None
+            ),
+        })
+    flagged = []
+    for req in unavailable:
+        ev = req.reported_unavailable
+        flagged.append({"document": req.document, "reason": (ev.payload or {}).get("reason"), "at": ev.at})
+    answered = len(received) + len(flagged)
+    total = answered + len(open_)
+    return {
+        "open": shown,
+        "shown": len(shown),
+        "total_open": len(open_),
+        "hidden": max(len(open_) - len(shown), 0),
+        "queue_size": CLIENT_QUEUE_SIZE,
+        "received": [{"ref": r.ref, "document": r.document} for r in received],
+        "unavailable": flagged,
+        "answered": answered,
+        "total": total,
+        "percent": round(100 * answered / total) if total else 100,
+        "scope_name": token.owner_person,
+    }
+
+
+def _client_request(session: Session, token_str: str, request_id: int):
+    """Resolve the link and the request it is being used on; refuse anything outside its scope and
+    anything the queue has not unlocked yet. Returns (token, engagement, request)."""
+    token, eng = resolve_token(session, token_str)
+    req = session.get(Request, request_id)
+    if req is None or req.engagement_id != eng.id or not token_covers(token, req):
+        raise NotFoundError("That request is not part of this link.")
+    open_, _received, unavailable = _client_buckets(session, eng, token)
+    if request_id in {r.id for r in unavailable}:
+        raise LedgerError("You told us you do not have this one. If you find it, please contact us and we will reopen it.")
+    if request_id in {r.id for r in open_} and request_id not in {r.id for r in open_[:CLIENT_QUEUE_SIZE]}:
+        raise LedgerError("Please finish the items shown first - this one unlocks as you complete them.")
+    return token, eng, req
 
 
 def client_upload(
@@ -2091,18 +2205,43 @@ def client_upload(
     files: list[tuple[str, bytes]],
     submitted_by: Optional[str] = None,
 ) -> dict:
-    """A client upload through the link: no account, no password. The token is the only credential
-    and it only reaches requests of its own engagement."""
-    token, eng = resolve_token(session, token_str)
-    req = session.get(Request, request_id)
-    if req is None or req.engagement_id != eng.id:
-        raise NotFoundError("That request is not part of this link.")
+    """A client upload through the link: no account, no password. The files are the pages of ONE
+    submission, in exactly the order given (page_order 1, 2, 3 ...). The token is the only
+    credential; it only reaches the requests it covers, and only the ones currently shown."""
+    _token, _eng, req = _client_request(session, token_str, request_id)
     name = _clean(submitted_by)
-    result = record_submission(
+    return record_submission(
         session, request_id, f"{name} (client)" if name else CLIENT_ACTOR, files,
         channel="Tokenised link", submitted_by=name or req.owner_person,
     )
-    return result
+
+
+def client_report_unavailable(
+    session: Session, token_str: str, request_id: int, reason: str, submitted_by: Optional[str] = None
+) -> RequestEvent:
+    """"I don't have this": the client says, with a reason, that they cannot provide the document.
+    Appends a CLIENT_REPORTED_UNAVAILABLE event (it is information - it does not change the state,
+    and the firm decides whether to waive, mark not applicable, or press on)."""
+    reason = _clean(reason)
+    if not reason or len(reason) < 3:
+        raise LedgerError("Please tell us briefly why you do not have it.")
+    if len(reason) > 1000:
+        raise LedgerError("That explanation is too long (1000 characters maximum).")
+    token, eng, req = _client_request(session, token_str, request_id)
+    name = _clean(submitted_by)
+    try:
+        locked = _lock_request(session, request_id)
+        if locked.state not in SUBMITTABLE_STATES or locked.engagement.status != "Active":
+            raise InvalidTransition(f"This request cannot be answered now (it is '{locked.state}').")
+        event = _insert_event(
+            session, locked, E.CLIENT_UNAVAILABLE, f"{name} (client)" if name else CLIENT_ACTOR,
+            "Tokenised link", {"reason": reason}, utcnow(),
+        )
+        session.commit()
+        return event
+    except Exception:
+        session.rollback()
+        raise
 
 
 # ---- batch release -----------------------------------------------------------------------------
@@ -2171,28 +2310,39 @@ def release_requests(session: Session, engagement_id: int, request_ids: list[int
         raise
 
 
-def send_client_link(session: Session, engagement_id: int, actor: str) -> OutboundEmail:
-    """(Re-)send the engagement's live link, with the list of requests currently waiting on the
-    client, to the client's email address."""
+def send_client_link(
+    session: Session, engagement_id: int, actor: str, token_id: Optional[int] = None
+) -> OutboundEmail:
+    """(Re-)send a live link - the whole-engagement one by default, or the one given - with the list
+    of requests it covers that are waiting on the client, to the client's email address."""
     actor = _require_actor(actor)
     eng = get_engagement(session, engagement_id)
     if eng.status != "Active":
         raise LedgerError("This engagement is closed; no client link can be sent.")
     if not eng.client_email:
         raise LedgerError("Set the client's email address first (Settings).")
-    token = active_token(session, engagement_id)
+    if token_id:
+        token = next((t for t in _live_tokens(session, engagement_id) if t.id == int(token_id)), None)
+    else:
+        token = active_token(session, engagement_id)
     if token is None:
         raise LedgerError("There is no live link - generate one first.")
-    waiting = [r for r in engagement_requests(session, engagement_id) if r.state in SUBMITTABLE_STATES]
+    waiting = [
+        r for r in engagement_requests(session, engagement_id)
+        if r.state in SUBMITTABLE_STATES and token_covers(token, r)
+    ]
+    scope = f" for {token.owner_person}" if token.owner_person else ""
     body = (
         f"Dear {eng.client_name} team,\n\n"
-        f"Here is your upload link for {eng.name}. No login or password is needed.\n\n"
+        f"Here is your upload link{scope} for {eng.name}. No login or password is needed.\n\n"
         f"{emailer.client_link_url(token.token)}\n\n"
-        f"It is valid until {token.expires_at.strftime('%d %B %Y')}.\n\n"
+        f"It is valid until {token.expires_at.strftime('%d %B %Y')}. "
+        f"We show five items at a time; as you finish them the next ones appear.\n\n"
         + (f"Still waiting on:\n{_request_lines(waiting)}\n\n" if waiting else "")
         + f"Thank you,\n{actor}\n"
     )
-    args = dict(kind="client_link", to_address=eng.client_email, subject=f"Your upload link - {eng.name}",
+    args = dict(kind="client_link", to_address=eng.client_email,
+                subject=f"Your upload link{scope} - {eng.name}",
                 body=body, created_by=actor, engagement_id=eng.id, token_id=token.id)
     try:
         mail = emailer.dispatch(session, **args)

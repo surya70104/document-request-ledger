@@ -2,65 +2,135 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="robots" content="noindex, nofollow">
   <meta name="referrer" content="no-referrer">
-  <title>Documents for {{ eng.client_name }}</title>
+  <meta name="theme-color" content="#0f172a">
+  <title>Documents for {{ view.scope_name or eng.client_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="min-h-screen bg-slate-50 text-slate-800 antialiased">
+<body class="min-h-screen bg-slate-50 pb-10 text-slate-800 antialiased">
   <header class="bg-slate-900 text-white">
-    <div class="mx-auto max-w-2xl px-4 py-5">
+    <div class="mx-auto max-w-xl px-4 py-5">
       <p class="text-xs uppercase tracking-wide text-slate-400">{{ firm_name }}</p>
-      <h1 class="mt-1 text-xl font-semibold leading-snug">Documents we need from {{ eng.client_name }}</h1>
-      <p class="mt-1 text-sm text-slate-300">{{ eng.engagement_type }} · {{ eng.period_from|fdate }} to {{ eng.period_to|fdate }}</p>
+      <h1 class="mt-1 text-xl font-semibold leading-snug">{% if view.scope_name %}Hello {{ view.scope_name.split(' ')[0] }} - documents we need from you{% else %}Documents we need from {{ eng.client_name }}{% endif %}</h1>
+      <p class="mt-1 text-sm text-slate-300">{{ eng.client_name }} · {{ eng.engagement_type }} · {{ eng.period_from|fdate }} to {{ eng.period_to|fdate }}</p>
     </div>
   </header>
 
-  <main class="mx-auto max-w-2xl space-y-4 px-4 py-6">
-    <section class="rounded-lg border border-slate-200 bg-white p-4 text-sm leading-relaxed">
-      <p><b>No login and no password.</b> For each item below, choose the file (or take a photo) and press <b>Upload</b>. If a document has several pages, choose all the pages together.</p>
-      <p class="mt-2 text-slate-500">This link is valid until {{ expires_at|fdate }}.</p>
-      <label class="mt-3 block text-xs font-medium text-slate-600" for="who">Your name (so we know who sent it)</label>
-      <input id="who" type="text" maxlength="200" autocomplete="name" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-base" placeholder="e.g. Ravi Menon">
+  <main class="mx-auto max-w-xl space-y-4 px-4 py-5">
+    {# ---- how it works + name ---- #}
+    <section class="rounded-xl border border-slate-200 bg-white p-4 text-[15px] leading-relaxed">
+      <p><b>No login, no password.</b> For each item, take a photo or choose a file, check the pages are in the right order, and press <b>Upload</b>. Don't have something? Tell us - that helps too.</p>
+      <label class="mt-3 block text-sm font-medium text-slate-600" for="who">Your name (so we know who sent it)</label>
+      <input id="who" type="text" maxlength="200" autocomplete="name" class="mt-1 min-h-[48px] w-full rounded-lg border border-slate-300 px-3 py-2 text-base" placeholder="e.g. Ravi Menon">
+      <p class="mt-2 text-xs text-slate-500">This link is valid until {{ expires_at|fdate }}.</p>
     </section>
 
-    {% if view.open %}
-    <p class="px-1 text-sm font-medium text-slate-600">{{ view.open|length }} item{{ '' if view.open|length == 1 else 's' }} waiting, most important first</p>
+    {# ---- progress ---- #}
+    {% if view.total %}
+    <section class="rounded-xl border border-slate-200 bg-white p-4" aria-label="Progress">
+      <div class="flex items-baseline justify-between text-sm">
+        <span class="font-semibold text-slate-900">{{ view.answered }} of {{ view.total }} done</span>
+        <span class="tabular-nums text-slate-500">{{ view.percent }}%</span>
+      </div>
+      <div class="mt-2 h-3 overflow-hidden rounded-full bg-slate-200" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ view.percent }}">
+        <div class="h-3 rounded-full bg-emerald-500" style="width: {{ view.percent }}%"></div>
+      </div>
+      {% if view.hidden %}
+      <p id="queue-note" class="mt-3 rounded-lg bg-sky-50 px-3 py-2 text-sm text-sky-950 ring-1 ring-sky-200">Showing <b>{{ view.shown }} of {{ view.total_open }}</b> open items - complete these to unlock the rest.</p>
+      {% elif view.total_open %}
+      <p id="queue-note" class="mt-3 text-sm text-slate-600">{{ view.total_open }} open item{{ '' if view.total_open == 1 else 's' }}, most important first.</p>
+      {% endif %}
+    </section>
     {% endif %}
 
+    {# ---- the queue: at most five, in priority order ---- #}
     {% for r in view.open %}
-    <section class="req-card rounded-lg border border-slate-200 bg-white shadow-sm" data-id="{{ r.id }}">
+    <section class="req-card overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm" data-id="{{ r.id }}">
       <div class="border-b border-slate-100 px-4 py-3">
-        <h2 class="text-base font-semibold leading-snug text-slate-900">{{ r.label }}</h2>
-        {% if r.label != r.document %}<p class="text-sm text-slate-600">{{ r.document }}</p>{% endif %}
-        <p class="mt-1 text-xs text-slate-500">{{ r.period }} · asked of {{ r.owner }}{% if r.attempt > 1 %} · attempt {{ r.attempt }}{% endif %}</p>
+        <div class="flex items-start gap-3">
+          <span class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-900 text-sm font-bold text-white">{{ loop.index }}</span>
+          <div class="min-w-0">
+            <h2 class="text-[17px] font-semibold leading-snug text-slate-900">{{ r.label }}</h2>
+            {% if r.label != r.document %}<p class="text-sm text-slate-600">{{ r.document }}</p>{% endif %}
+            <p class="mt-1 text-sm text-slate-500">{{ r.period }}{% if not view.scope_name %} · asked of {{ r.owner }}{% endif %}</p>
+            <div class="mt-2 flex flex-wrap gap-1.5">
+              {% if r.material %}<span class="rounded-full bg-rose-100 px-2.5 py-0.5 text-xs font-semibold text-rose-800 ring-1 ring-inset ring-rose-300">Important for the audit</span>{% endif %}
+              {% if r.attempt > 1 %}<span class="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-inset ring-amber-300">Sending again (attempt {{ r.attempt }})</span>{% endif %}
+            </div>
+          </div>
+        </div>
       </div>
+
       {% if r.rejection %}
-      <div class="border-b border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
-        <p class="font-semibold">We could not use the last file we received.</p>
+      <div class="border-b border-amber-200 bg-amber-50 px-4 py-3 text-[15px] leading-relaxed text-amber-950">
+        <p class="font-semibold">We could not use the last file you sent.</p>
         <p class="mt-0.5">{{ r.rejection.message }}{% if r.rejection.detail %} {{ r.rejection.detail }}{% endif %}</p>
       </div>
       {% endif %}
-      <form class="upload-form space-y-3 px-4 py-3" data-id="{{ r.id }}">
-        <input type="file" name="files" multiple required
-               class="block w-full text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-4 file:py-2.5 file:text-sm file:font-medium file:text-white">
-        <p class="msg hidden rounded-md px-3 py-2 text-sm"></p>
-        <button type="submit" class="w-full rounded-md bg-emerald-600 px-4 py-3 text-base font-semibold text-white hover:bg-emerald-700 disabled:opacity-60 sm:w-auto">Upload</button>
-      </form>
+
+      <div class="uploader space-y-3 px-4 py-4">
+        <div class="grid grid-cols-2 gap-2">
+          <label class="flex min-h-[56px] cursor-pointer items-center justify-center gap-2 rounded-xl bg-slate-900 px-3 py-3 text-center text-base font-semibold text-white active:bg-slate-700 has-[:focus-visible]:ring-4 has-[:focus-visible]:ring-sky-400">
+            <svg class="h-6 w-6 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+            <span>Take a photo</span>
+            <input type="file" class="cam sr-only" accept="image/*,.pdf" capture="environment">
+          </label>
+          <label class="flex min-h-[56px] cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-slate-900 bg-white px-3 py-3 text-center text-base font-semibold text-slate-900 active:bg-slate-100 has-[:focus-visible]:ring-4 has-[:focus-visible]:ring-sky-400">
+            <svg class="h-6 w-6 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <span>Choose files</span>
+            <input type="file" class="pick sr-only" multiple accept="image/*,.pdf,.xls,.xlsx,.csv,.doc,.docx,.zip,.txt">
+          </label>
+        </div>
+        <p class="pages-empty text-sm text-slate-500">Photographing a long document? Take one photo per page - they stack up below, in order. You can add more any time.</p>
+        <ol class="pages space-y-2"></ol>
+        <p class="msg hidden rounded-lg px-3 py-2 text-sm"></p>
+        <button type="button" class="send min-h-[52px] w-full rounded-xl bg-emerald-600 px-4 py-3 text-lg font-bold text-white active:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-slate-300" disabled>Upload</button>
+        <button type="button" class="idk min-h-[48px] w-full rounded-xl border border-slate-300 bg-white px-4 py-2.5 text-base font-medium text-slate-700 active:bg-slate-100">I don't have this</button>
+      </div>
+
+      <div class="idk-panel hidden space-y-3 border-t border-slate-200 bg-slate-50 px-4 py-4">
+        <p class="text-[15px] font-semibold text-slate-900">Why don't you have it?</p>
+        <div class="flex flex-wrap gap-2">
+          {% for reason in ['Not applicable to our business', 'Record not maintained', 'Held by someone else', 'Not available yet'] %}
+          <button type="button" class="chip min-h-[44px] rounded-full border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 active:bg-slate-200">{{ reason }}</button>
+          {% endfor %}
+        </div>
+        <textarea class="reason w-full rounded-lg border border-slate-300 px-3 py-2 text-base" rows="3" maxlength="1000" placeholder="A few words are enough"></textarea>
+        <p class="idk-msg hidden rounded-lg px-3 py-2 text-sm"></p>
+        <div class="grid grid-cols-2 gap-2">
+          <button type="button" class="idk-cancel min-h-[48px] rounded-xl border border-slate-300 bg-white px-3 py-2 text-base font-medium text-slate-700">Cancel</button>
+          <button type="button" class="idk-send min-h-[48px] rounded-xl bg-slate-900 px-3 py-2 text-base font-semibold text-white active:bg-slate-700">Send</button>
+        </div>
+      </div>
     </section>
     {% else %}
-    <section class="rounded-lg border border-emerald-200 bg-emerald-50 p-5 text-center text-emerald-900">
+    <section class="rounded-xl border border-emerald-200 bg-emerald-50 p-6 text-center text-emerald-900">
       <p class="text-lg font-semibold">Nothing is waiting on you right now.</p>
       <p class="mt-1 text-sm">Thank you. We will be in touch if anything else is needed.</p>
     </section>
     {% endfor %}
 
+    <section id="all-done" class="hidden rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-center text-emerald-900">
+      <p class="text-base font-semibold">All done for now - thank you.</p>
+      <p class="mt-1 text-sm">{% if view.hidden %}Loading your next items...{% else %}We will check everything and tell you only if something else is needed.{% endif %}</p>
+    </section>
+
     {% if view.received %}
-    <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <section class="rounded-xl border border-slate-200 bg-white p-4">
       <h3 class="text-sm font-semibold text-slate-900">Received - we are checking these</h3>
-      <ul class="mt-2 space-y-1 text-sm text-slate-700">
+      <ul class="mt-2 space-y-1.5 text-sm text-slate-700">
         {% for r in view.received %}<li>&#10003; {{ r.document }}</li>{% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if view.unavailable %}
+    <section class="rounded-xl border border-slate-200 bg-white p-4">
+      <h3 class="text-sm font-semibold text-slate-900">You told us you don't have these</h3>
+      <ul class="mt-2 space-y-2 text-sm text-slate-700">
+        {% for r in view.unavailable %}<li><span class="font-medium">{{ r.document }}</span><br><span class="text-slate-500">"{{ r.reason }}" - we will get back to you.</span></li>{% endfor %}
       </ul>
     </section>
     {% endif %}
@@ -69,38 +139,129 @@
 <script>
 (() => {
   const token = {{ token|tojson }};
+  const hasMore = {{ 'true' if view.hidden else 'false' }};
   const who = document.getElementById('who');
   try { who.value = localStorage.getItem('oak-client-name') || ''; } catch (e) {}
   who.addEventListener('input', () => { try { localStorage.setItem('oak-client-name', who.value); } catch (e) {} });
 
-  document.querySelectorAll('.upload-form').forEach((form) => {
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const msg = form.querySelector('.msg');
-      const btn = form.querySelector('button');
-      msg.className = 'msg hidden rounded-md px-3 py-2 text-sm';
-      btn.disabled = true; btn.textContent = 'Uploading...';
-      const fd = new FormData(form);
-      fd.set('submitted_by', who.value.trim());
+  const cards = [...document.querySelectorAll('.req-card')];
+  let remaining = cards.length;
+  const fileKey = (f) => [f.name, f.size, f.lastModified].join('|');
+  const human = (n) => (n < 1048576 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
+  const say = (el, text, good) => {
+    el.textContent = text;
+    el.className = (el.className.split(' ').filter((c) => !/^(bg|ring)-|^text-(emerald|rose)-|^hidden$/.test(c)).join(' ')) + (good ? ' bg-emerald-50 text-emerald-900' : ' bg-rose-50 text-rose-800 ring-1 ring-rose-200');
+  };
+
+  function finished(card, title, text) {
+    card.innerHTML = '<div class="bg-emerald-50 px-4 py-5 text-emerald-900"><p class="text-lg font-semibold">&#10003; ' + title + '</p><p class="mt-1 text-[15px]">' + text + '</p></div>';
+    remaining -= 1;
+    if (remaining === 0) {
+      document.getElementById('all-done').classList.remove('hidden');
+      document.getElementById('all-done').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(() => location.reload(), hasMore ? 1600 : 2600);
+    }
+  }
+
+  async function post(url, fd) {
+    try {
+      const res = await fetch(url, { method: 'POST', body: fd });
       let data = {};
-      let ok = false;
-      try {
-        const res = await fetch(`/c/${encodeURIComponent(token)}/requests/${form.dataset.id}/upload`, { method: 'POST', body: fd });
-        ok = res.ok;
-        try { data = await res.json(); } catch (x) {}
-      } catch (x) { data = { error: 'Could not reach the server. Please check your connection and try again.' }; }
-      if (!ok) {
-        btn.disabled = false; btn.textContent = 'Upload';
-        msg.textContent = data.error || 'That did not work. Please try again.';
-        msg.className = 'msg rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-rose-200';
-        return;
-      }
-      const card = form.closest('.req-card');
-      form.remove();
-      const done = document.createElement('div');
-      done.className = 'bg-emerald-50 px-4 py-4 text-sm text-emerald-900';
-      done.innerHTML = '<p class="text-base font-semibold">&#10003; Received - thank you.</p><p class="mt-0.5">We will check it and let you know only if something else is needed.</p>';
-      card.appendChild(done);
+      try { data = await res.json(); } catch (x) {}
+      return { ok: res.ok, data };
+    } catch (x) {
+      return { ok: false, data: { error: 'Could not reach the server. Please check your connection and try again.' } };
+    }
+  }
+
+  cards.forEach((card) => {
+    const id = card.dataset.id;
+    const base = `/c/${encodeURIComponent(token)}/requests/${id}`;
+    const list = card.querySelector('.pages');
+    const empty = card.querySelector('.pages-empty');
+    const send = card.querySelector('.send');
+    const msg = card.querySelector('.msg');
+    let files = [];            // the pages, in the order they will be sent
+    const previews = new Map();
+
+    function preview(f) {
+      if (!previews.has(f)) previews.set(f, f.type.startsWith('image/') ? URL.createObjectURL(f) : null);
+      return previews.get(f);
+    }
+    function mkBtn(label, act, i, disabled, extra) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.dataset.act = act; b.dataset.i = i; b.textContent = label; b.disabled = disabled;
+      b.className = 'min-h-[44px] min-w-[44px] rounded-lg border border-slate-300 bg-white px-2.5 text-sm font-semibold text-slate-700 active:bg-slate-200 disabled:opacity-30 ' + (extra || '');
+      b.setAttribute('aria-label', `${label} - page ${i + 1}`);
+      return b;
+    }
+    function render() {
+      list.replaceChildren();
+      files.forEach((f, i) => {
+        const li = document.createElement('li');
+        li.className = 'flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-2';
+        const url = preview(f);
+        let thumb;
+        if (url) { thumb = document.createElement('img'); thumb.src = url; thumb.alt = ''; thumb.className = 'h-16 w-16 shrink-0 rounded-lg object-cover'; }
+        else { thumb = document.createElement('div'); thumb.textContent = (f.name.split('.').pop() || 'file').slice(0, 4).toUpperCase(); thumb.className = 'flex h-16 w-16 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-xs font-bold text-slate-500'; }
+        const meta = document.createElement('div');
+        meta.className = 'min-w-0 flex-1';
+        const t = document.createElement('div'); t.className = 'text-base font-bold text-slate-900'; t.textContent = `Page ${i + 1}`;
+        const n = document.createElement('div'); n.className = 'truncate text-xs text-slate-500'; n.textContent = `${f.name} · ${human(f.size)}`;
+        meta.append(t, n);
+        const ctl = document.createElement('div');
+        ctl.className = 'flex shrink-0 gap-1';
+        ctl.append(mkBtn('Up', 'up', i, i === 0), mkBtn('Down', 'down', i, i === files.length - 1), mkBtn('Remove', 'remove', i, false, 'text-rose-700'));
+        li.append(thumb, meta, ctl);
+        list.append(li);
+      });
+      empty.classList.toggle('hidden', files.length > 0);
+      send.disabled = files.length === 0;
+      send.textContent = files.length ? `Upload ${files.length} page${files.length === 1 ? '' : 's'}` : 'Upload';
+    }
+    function add(fileList) {
+      for (const f of fileList) { if (!files.some((x) => fileKey(x) === fileKey(f))) files.push(f); }
+      msg.classList.add('hidden');
+      render();
+    }
+    card.querySelector('.cam').addEventListener('change', (e) => { add(e.target.files); e.target.value = ''; });
+    card.querySelector('.pick').addEventListener('change', (e) => { add(e.target.files); e.target.value = ''; });
+
+    list.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-act]');
+      if (!b) return;
+      const i = Number(b.dataset.i);
+      if (b.dataset.act === 'up' && i > 0) [files[i - 1], files[i]] = [files[i], files[i - 1]];
+      if (b.dataset.act === 'down' && i < files.length - 1) [files[i + 1], files[i]] = [files[i], files[i + 1]];
+      if (b.dataset.act === 'remove') { const [gone] = files.splice(i, 1); const u = previews.get(gone); if (u) URL.revokeObjectURL(u); previews.delete(gone); }
+      render();
+    });
+
+    send.addEventListener('click', async () => {
+      if (!files.length) return;
+      send.disabled = true; send.textContent = 'Uploading...';
+      const fd = new FormData();
+      files.forEach((f) => fd.append('files', f, f.name));   // sent in exactly this order = page 1, 2, 3 ...
+      fd.set('submitted_by', who.value.trim());
+      const { ok, data } = await post(base + '/upload', fd);
+      if (!ok) { render(); say(msg, data.error || 'That did not work. Please try again.', false); return; }
+      finished(card, 'Received - thank you.', 'We will check it and tell you only if something else is needed.');
+    });
+
+    // ---- "I don't have this"
+    const panel = card.querySelector('.idk-panel');
+    const reason = card.querySelector('.reason');
+    const idkMsg = card.querySelector('.idk-msg');
+    card.querySelector('.idk').addEventListener('click', () => { panel.classList.remove('hidden'); reason.focus(); });
+    card.querySelector('.idk-cancel').addEventListener('click', () => { panel.classList.add('hidden'); });
+    card.querySelectorAll('.chip').forEach((c) => c.addEventListener('click', () => { reason.value = c.textContent; reason.focus(); }));
+    card.querySelector('.idk-send').addEventListener('click', async () => {
+      const text = reason.value.trim();
+      if (text.length < 3) { say(idkMsg, 'Please tell us briefly why you do not have it.', false); return; }
+      const fd = new FormData(); fd.set('reason', text); fd.set('submitted_by', who.value.trim());
+      const { ok, data } = await post(base + '/unavailable', fd);
+      if (!ok) { say(idkMsg, data.error || 'That did not work. Please try again.', false); return; }
+      finished(card, 'Thank you - we have noted that.', 'We will get back to you about this one.');
     });
   });
 })();

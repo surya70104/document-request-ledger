@@ -69,6 +69,7 @@ EVENT_DOT = {
     "NOT_APPLICABLE": "bg-stone-400",
     "UNFULFILLED_AT_REPORT_DATE": "bg-red-600",
     "CHASED": "bg-orange-500",
+    "CLIENT_REPORTED_UNAVAILABLE": "bg-fuchsia-500",
     "NOTE": "bg-slate-300",
 }
 PAYLOAD_LABELS = {
@@ -735,7 +736,8 @@ def client_page(http_request: HttpRequest, token: str, session: Session = Depend
     resp = templates.TemplateResponse(
         http_request,
         "client.html",
-        {"eng": eng, "token": token, "view": services.client_view(session, eng), "expires_at": opened["token"].expires_at},
+        {"eng": eng, "token": token, "view": services.client_view(session, eng, opened["token"]),
+         "expires_at": opened["token"].expires_at},
     )
     resp.headers.update(NO_STORE)
     return resp
@@ -760,6 +762,19 @@ def client_upload(
     )
 
 
+@app.post("/c/{token}/requests/{request_id}/unavailable")
+def client_unavailable(
+    token: str,
+    request_id: int,
+    reason: str = Form(""),
+    submitted_by: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    """"I don't have this": appends a CLIENT_REPORTED_UNAVAILABLE event with the client's reason."""
+    event = services.client_report_unavailable(session, token, request_id, reason, submitted_by)
+    return JSONResponse({"ok": True, "seq": event.seq}, headers=NO_STORE)
+
+
 @app.get("/outbox", response_class=HTMLResponse)
 def outbox(http_request: HttpRequest, eng: Optional[int] = None, session: Session = Depends(get_session)):
     """Every email the module sent (or would send): open the links straight from here."""
@@ -778,11 +793,15 @@ def outbox(http_request: HttpRequest, eng: Optional[int] = None, session: Sessio
 @app.get("/engagements/{engagement_id}/client-link", response_class=HTMLResponse)
 def client_link_view(http_request: HttpRequest, engagement_id: int, session: Session = Depends(get_session)):
     eng = services.get_engagement(session, engagement_id)
-    token = services.active_token(session, engagement_id)
+    live = [
+        {"token": t, "link": emailer.client_link_url(t.token)} for t in services.live_tokens(session, engagement_id)
+    ]
+    # whole-engagement link first, then owner-scoped links by name
+    live.sort(key=lambda x: (bool(x["token"].owner_person), (x["token"].owner_person or "").lower()))
     return templates.TemplateResponse(
         http_request,
         "partials/clientlink.html",
-        {"eng": eng, "token": token, "link": emailer.client_link_url(token.token) if token else None,
+        {"eng": eng, "live": live, "owners": services.engagement_owner_names(session, engagement_id),
          "tokens": services.list_tokens(session, engagement_id)},
     )
 
@@ -790,15 +809,18 @@ def client_link_view(http_request: HttpRequest, engagement_id: int, session: Ses
 @app.post("/engagements/{engagement_id}/client-link/generate")
 def client_link_generate(
     engagement_id: int, actor: str = Form(""), days: int = Form(services.TOKEN_DEFAULT_DAYS),
-    session: Session = Depends(get_session),
+    owner: str = Form(""), session: Session = Depends(get_session),
 ):
-    token = services.create_client_token(session, engagement_id, actor, days=days)
-    return {"ok": True, "link": emailer.client_link_url(token.token)}
+    """A link for the whole engagement, or (owner given) one scoped to a named client-side owner."""
+    token = services.create_client_token(session, engagement_id, actor, days=days, owner_person=owner)
+    return {"ok": True, "link": emailer.client_link_url(token.token), "owner": token.owner_person}
 
 
 @app.post("/engagements/{engagement_id}/client-link/resend")
-def client_link_resend(engagement_id: int, actor: str = Form(""), session: Session = Depends(get_session)):
-    mail = services.send_client_link(session, engagement_id, actor)
+def client_link_resend(
+    engagement_id: int, actor: str = Form(""), token_id: int = Form(0), session: Session = Depends(get_session)
+):
+    mail = services.send_client_link(session, engagement_id, actor, token_id or None)
     return {"ok": True, "email_id": mail.id, "status": mail.status, "to": mail.to_address}
 
 

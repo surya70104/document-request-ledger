@@ -444,6 +444,10 @@ def _pass1_topup(session, eng) -> None:
         token = services.active_token(session, eng.id) or services.create_client_token(session, eng.id, MANAGER)
         import emailer
         print(f"[seed] client upload link: {emailer.client_link_url(token.token)}")
+        scoped = services.active_token(session, eng.id, "Meera Shah")
+        if scoped is None:
+            scoped = services.create_client_token(session, eng.id, MANAGER, owner_person="Meera Shah")
+        print(f"[seed] link for Meera Shah only: {emailer.client_link_url(scoped.token)}")
 
 
 def _stage4_topup(session, eng) -> None:

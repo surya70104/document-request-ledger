@@ -32,6 +32,15 @@
   </div>
 </div>
 
+{% set gone = r.reported_unavailable %}
+{% if gone %}
+<div class="border-b border-fuchsia-300 bg-fuchsia-50 px-5 py-3 text-sm text-fuchsia-950" id="unavailable-alert">
+  <p class="font-semibold">&#9888; The client says they don't have this document.</p>
+  <p class="mt-0.5">&ldquo;{{ gone.payload.get('reason', '') }}&rdquo; <span class="text-fuchsia-800">- {{ gone.actor }}, {{ gone.at|ist }}</span></p>
+  <p class="mt-1 text-xs text-fuchsia-900">Decide what to do: waive it, mark it not applicable, or re-request it. It stays open until you do.</p>
+</div>
+{% endif %}
+
 <dl class="grid grid-cols-2 gap-x-4 gap-y-3 border-b border-slate-200 bg-slate-50 px-5 py-4 text-sm">
   <div><dt class="text-xs uppercase tracking-wide text-slate-500">Client owner</dt><dd class="font-medium">{{ r.owner_person }}</dd></div>
   <div><dt class="text-xs uppercase tracking-wide text-slate-500">Period asked for</dt><dd class="font-medium">{{ period_text(r) }}</dd></div>

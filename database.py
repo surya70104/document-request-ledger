@@ -212,6 +212,9 @@ _MIGRATIONS = [
     "UPDATE engagement SET closed_at = COALESCE("
     "(SELECT max(e.at) FROM request_event e JOIN request r ON r.id = e.request_id WHERE r.engagement_id = engagement.id), "
     "CAST(report_date AS TIMESTAMPTZ), now()) WHERE status = 'Closed' AND closed_at IS NULL",
+    # Pass 2 / Screen 4: owner-scoped client links. (The event_type CHECK below is rebuilt from
+    # models.ALL_EVENT_TYPES, which now includes CLIENT_REPORTED_UNAVAILABLE.)
+    "ALTER TABLE client_token ADD COLUMN IF NOT EXISTS owner_person VARCHAR(200)",
     # Pass 1 completion: engagement settings (the chase / outbound_email / client_token tables are
     # created by create_all).
     "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS published_by VARCHAR(200)",
