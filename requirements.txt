@@ -7,3 +7,8 @@ jinja2>=3.1,<4.0
 python-dotenv>=1.0,<2.0
 # Required by FastAPI to parse the HTML form posts (Form(...)) used by the UI.
 python-multipart>=0.0.9
+
+# Test suite (run `pytest`). httpx powers FastAPI's TestClient. pytest-asyncio is not needed: the
+# app and tests are synchronous.
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0

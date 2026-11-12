@@ -10,7 +10,7 @@ from typing import Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Query, Request as HttpRequest, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -440,7 +440,7 @@ def close_engagement(
     frozen = services.close_engagement(
         session, engagement_id, actor, report_date=_parse_date(report_date, "Report date")
     )
-    return {"ok": True, "frozen": [r.ref for r in frozen]}
+    return {"ok": True, "frozen": [r.ref for r in frozen], "closeout_url": f"/engagements/{engagement_id}/close-out"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -617,6 +617,50 @@ def export_thread(
     A standalone, print-ready page (Save as PDF from the browser's print dialog)."""
     ctx = services.export_context(session, engagement_id, ref)
     return templates.TemplateResponse(http_request, "export.html", {**ctx, "exported_by": by.strip()})
+
+
+# --------------------------------------------------------------------------------------------
+# Stage 5: close-out screen and the downstream evidence outputs
+# --------------------------------------------------------------------------------------------
+@app.get("/engagements/{engagement_id}/close-out", response_class=HTMLResponse)
+def closeout_screen(http_request: HttpRequest, engagement_id: int, session: Session = Depends(get_session)):
+    """Screen 5: unfulfilled summary, EQR readiness gate, SA 705 extract, SA 580 schedule."""
+    rep = services.closeout_report(session, engagement_id)
+    return templates.TemplateResponse(http_request, "closeout.html", {"eng": rep["engagement"], "rep": rep})
+
+
+def _closeout_doc(doc: str) -> str:
+    if doc not in ("sa705", "sa580"):
+        raise services.NotFoundError("Unknown close-out document.")
+    return doc
+
+
+@app.get("/engagements/{engagement_id}/close-out/{doc}", response_class=HTMLResponse)
+def closeout_print(
+    http_request: HttpRequest,
+    engagement_id: int,
+    doc: str,
+    by: str = Query(""),
+    session: Session = Depends(get_session),
+):
+    """Print-ready SA 705 extract or SA 580 schedule (use the browser's Save as PDF)."""
+    rep = services.closeout_report(session, engagement_id)
+    return templates.TemplateResponse(
+        http_request,
+        "closeout_print.html",
+        {"eng": rep["engagement"], "rep": rep, "doc": _closeout_doc(doc), "exported_by": by.strip()},
+    )
+
+
+@app.get("/engagements/{engagement_id}/close-out/{doc}/download")
+def closeout_download(engagement_id: int, doc: str, session: Session = Depends(get_session)):
+    rep = services.closeout_report(session, engagement_id)
+    ref = f"engagement-{engagement_id}"
+    if _closeout_doc(doc) == "sa705":
+        body, media, name = rep["sa705"]["text"], "text/plain; charset=utf-8", f"SA705-extract-{ref}.txt"
+    else:
+        body, media, name = services.sa580_csv(rep), "text/csv; charset=utf-8", f"SA580-schedule-{ref}.csv"
+    return Response(body, media_type=media, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.get("/health")

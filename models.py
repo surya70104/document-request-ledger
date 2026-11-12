@@ -157,6 +157,7 @@ class Engagement(Base):
     period_to: Mapped[Optional[date]] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(10), nullable=False, default="Active")
     report_date: Mapped[Optional[date]] = mapped_column(Date)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     # Entity profile: flags/attributes that template-item conditions are evaluated against.
     entity_profile: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")

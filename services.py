@@ -129,7 +129,7 @@ def pending_submission(request: Request) -> Optional[Submission]:
 def available_actions(request: Request) -> list[tuple[str, str]]:
     """(event_type, label) pairs that are legal for this request right now."""
     if request.engagement.status == "Closed":
-        allowed = {E.NOTE}
+        allowed = set()  # a closed engagement is strictly read-only
     else:
         allowed = ALLOWED_NEXT.get(request.state or "", set()) - SYSTEM_ONLY
         if pending_submission(request):
@@ -388,8 +388,8 @@ def append_event(
     try:
         req = _lock_request(session, request_id)
         state = req.state
-        if req.engagement.status == "Closed" and event_type != E.NOTE:
-            raise InvalidTransition("The engagement is closed: its requests are frozen. Only notes can be added.")
+        if req.engagement.status == "Closed":
+            raise InvalidTransition("The engagement is closed and read-only: no further events can be recorded.")
         if event_type not in ALLOWED_NEXT.get(state or "", set()):
             raise InvalidTransition(
                 f"Cannot record '{EVENT_LABEL[event_type]}' while the request is '{state}'."
@@ -496,6 +496,8 @@ def record_submission(
     try:
         req = _lock_request(session, request_id)
         state = req.state
+        if req.engagement.status == "Closed":
+            raise InvalidTransition("The engagement is closed and read-only: no further uploads are accepted.")
         if state == "Drafted":
             raise InvalidTransition("This request has not been sent to the client yet - mark it Sent first.")
 
@@ -508,8 +510,6 @@ def record_submission(
             seen.add(digest)
 
         if any(not dup for *_, dup in plan):
-            if req.engagement.status == "Closed":
-                raise InvalidTransition("The engagement is closed: its requests are frozen.")
             if state not in SUBMITTABLE_STATES:
                 raise InvalidTransition(
                     f"New content cannot be submitted while the request is '{state}'. "
@@ -728,6 +728,7 @@ def close_engagement(
             frozen.append(req)
 
         eng.status = "Closed"
+        eng.closed_at = at
         eng.report_date = report_date
         session.commit()
         return frozen
@@ -1498,3 +1499,214 @@ def _carry_counts(rows: list[dict]) -> dict:
     for r in rows:
         counts[r["carry_tag"]] = counts.get(r["carry_tag"], 0) + 1
     return counts
+
+
+# ============================================================================================
+# Stage 5 - close-out evidence: EQR gate, SA 705 extract, SA 580 schedule
+# ============================================================================================
+def eqr_gate(requests: list[Request], *, closed: bool) -> dict:
+    """The EQR readiness gate. A Material request that is open (engagement still running) or
+    Unfulfilled at report date (engagement closed) blocks it. Accepted, waived and not-applicable
+    material requests do not."""
+    blocking = [
+        r for r in requests
+        if r.significance == "Material" and (r.is_open or r.state == "Unfulfilled at report date")
+    ]
+    n = len(blocking)
+    if n == 0:
+        message = "PASSED: No material requests unfulfilled"
+    elif closed:
+        message = f"BLOCKED: {n} material request{'s' if n != 1 else ''} remain{'s' if n == 1 else ''} unfulfilled"
+    else:
+        message = (
+            f"BLOCKED: {n} material request{'s' if n != 1 else ''} still open - "
+            f"{'it' if n == 1 else 'they'} would be frozen as unfulfilled at close-out"
+        )
+    return {"passed": n == 0, "blocked": n > 0, "count": n, "message": message, "requests": blocking}
+
+
+def _fmt_date(d) -> str:
+    return d.strftime("%d %B %Y") if d else "-"
+
+
+def _period_phrase(pf: Optional[date], pt: Optional[date]) -> str:
+    if pf and pt:
+        return f"{_fmt_date(pf)} to {_fmt_date(pt)}"
+    if pt:
+        return f"as at {_fmt_date(pt)}"
+    if pf:
+        return f"from {_fmt_date(pf)}"
+    return "no period specified"
+
+
+def _unfulfilled_row(req: Request, now: datetime) -> dict:
+    frozen = next((ev for ev in reversed(req.events) if ev.event_type == E.UNFULFILLED), None)
+    return {
+        "req": req,
+        "id": req.id,
+        "ref": req.ref,
+        "document": req.document,
+        "period": _period_phrase(req.period_from, req.period_to),
+        "owner": req.owner_person,
+        "significance": req.significance,
+        "material": req.significance == "Material",
+        "chases": req.chase_count,
+        "attempts": req.attempt_count,
+        "requested_on": req.sent_at or req.created_at,
+        "released": req.sent_at is not None,  # a request never sent was never asked of the client
+        "frozen_from": (frozen.payload or {}).get("frozen_from_state") if frozen else req.state,
+        "age": req.age_days(now),
+    }
+
+
+def closeout_report(session: Session, engagement_id: int) -> dict:
+    """Everything Screen 5 shows. For an engagement that is still running it is a PREVIEW: the open
+    requests are listed as the ones that would be frozen. Nothing is written."""
+    eng = get_engagement(session, engagement_id)
+    requests = engagement_requests(session, engagement_id)
+    closed = eng.status == "Closed"
+    now = utcnow()
+
+    frozen_reqs = [
+        r for r in requests
+        if (r.state == "Unfulfilled at report date") or (not closed and r.is_open)
+    ]
+    rows = sorted(
+        (_unfulfilled_row(r, now) for r in frozen_reqs),
+        key=lambda x: (not x["material"], -x["age"], x["id"]),
+    )
+    counts = {
+        "raised": len(requests),
+        "accepted": sum(1 for r in requests if r.state == "Accepted"),
+        "waived_na": sum(1 for r in requests if r.state in ("Waived", "Not applicable")),
+        "unfulfilled": len(rows),
+    }
+    report_date = eng.report_date if closed else (eng.report_date or now.date())
+    gate = eqr_gate(requests, closed=closed)
+    material_rows = [x for x in rows if x["material"]]
+    report = {
+        "engagement": eng,
+        "closed": closed,
+        "preview": not closed,
+        "report_date": report_date,
+        "counts": counts,
+        "rows": rows,
+        "material_rows": material_rows,
+        "routine_rows": [x for x in rows if not x["material"]],
+        "gate": gate,
+        "open_now": sum(1 for r in requests if r.is_open) if not closed else 0,
+        "now": now,
+    }
+    report["sa705"] = sa705_extract(report)
+    report["sa580"] = sa580_schedule(report)
+    return report
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def sa705_extract(report: dict) -> dict:
+    """Drafted scope-limitation wording for the auditor's report (SA 705 Revised): the material
+    documents that were requested and not provided. A DRAFT for the engagement partner to adapt."""
+    eng = report["engagement"]
+    items = [x for x in report["material_rows"] if x["released"]]
+    routine = len([x for x in report["routine_rows"] if x["released"]])
+    unreleased = len([x for x in report["rows"] if not x["released"]])
+    period = _period_phrase(eng.period_from, eng.period_to)
+    heading = "Basis for Qualified Opinion - Limitation on Scope (draft)"
+    if not items:
+        return {
+            "has_limitation": False,
+            "heading": heading,
+            "intro": "",
+            "lines": [],
+            "conclusion": "",
+            "drafting_note": (
+                "No material document request is unfulfilled, so this engagement records no scope "
+                "limitation arising from documents that were not provided."
+            ),
+            "text": (
+                f"{heading}\n\nNo material document request is unfulfilled at "
+                f"{_fmt_date(report['report_date'])}; no scope limitation arises from documents not provided.\n"
+            ),
+        }
+    intro = (
+        f"As part of our audit of the financial statements of {eng.client_name} for the period {period}, we "
+        f"requested the documents listed below from management. They had not been provided to us as at "
+        f"{_fmt_date(report['report_date'])}."
+    )
+    listed = []
+    for i, x in enumerate(items, start=1):
+        listed.append(
+            f"({_roman(i)}) {x['document']} ({x['period']}) - requested on {_fmt_date(x['requested_on'])}; "
+            f"{_plural(x['chases'], 'follow-up')} made; held by {x['owner']} [{x['ref']}]."
+        )
+    conclusion = (
+        "We were unable to obtain sufficient appropriate audit evidence about the matters to which these "
+        "documents relate, and we were unable to satisfy ourselves by performing alternative audit procedures. "
+        "Consequently, we were unable to determine whether any adjustments might be necessary in respect of the "
+        "related amounts and disclosures in the financial statements."
+    )
+    note = (
+        "Drafting note: the engagement partner decides under SA 705 (Revised) whether the possible effects are "
+        "material but not pervasive (qualified opinion) or material and pervasive (disclaimer of opinion), and "
+        "aligns this paragraph with the final opinion wording."
+        + (f" {_plural(routine, 'routine request')} also remain unfulfilled; they are listed in the SA 580 schedule, not here."
+           if routine else "")
+        + (f" {_plural(unreleased, 'request')} frozen before being sent to the client {'is' if unreleased == 1 else 'are'} not listed: nothing was asked of management."
+           if unreleased else "")
+    )
+    text = "\n".join([heading, "", intro, "", *listed, "", conclusion, "", note, ""])
+    return {
+        "has_limitation": True,
+        "heading": heading,
+        "intro": intro,
+        "lines": listed,
+        "conclusion": conclusion,
+        "drafting_note": note,
+        "text": text,
+    }
+
+
+def _roman(n: int) -> str:
+    out = ""
+    for value, sym in ((10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while n >= value:
+            out += sym
+            n -= value
+    return out
+
+
+def sa580_schedule(report: dict) -> dict:
+    """The formal schedule of unfulfilled requests, to be attached to management's written
+    representation letter (SA 580). Every unfulfilled request is listed, material first."""
+    eng = report["engagement"]
+    rows = [x for x in report["rows"] if x["released"]]  # only what was actually asked of management
+    preamble = (
+        f"Schedule of documents requested by the auditor and not provided - annexure to the management "
+        f"representation letter for the audit of {eng.client_name} for the period "
+        f"{_period_phrase(eng.period_from, eng.period_to)}."
+    )
+    statement = (
+        f"Management acknowledges that the {_plural(len(rows), 'document request')} listed below were made by "
+        f"the auditor during the engagement and had not been fulfilled as at {_fmt_date(report['report_date'])}."
+        if rows else
+        f"No document request made by the auditor remained unfulfilled as at {_fmt_date(report['report_date'])}."
+    )
+    return {"preamble": preamble, "statement": statement, "rows": rows,
+            "unreleased": len(report["rows"]) - len(rows)}
+
+
+def sa580_csv(report: dict) -> str:
+    import csv
+    import io
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["No.", "Reference", "Document", "Period", "Client owner", "Significance",
+                "Requested on", "Chases", "Attempts", "State when frozen"])
+    for i, x in enumerate(report["sa580"]["rows"], start=1):
+        w.writerow([i, x["ref"], x["document"], x["period"], x["owner"], x["significance"],
+                    x["requested_on"].date().isoformat(), x["chases"], x["attempts"], x["frozen_from"] or ""])
+    return buf.getvalue()

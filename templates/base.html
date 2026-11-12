@@ -40,6 +40,31 @@
     });
     function currentActor() { return actorInput.value.trim(); }
   </script>
+  <script>
+    // Close-out: one confirmation flow, used from the dashboard and from the close-out screen.
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('[data-closeout]');
+      if (!btn) return;
+      const actor = currentActor();
+      if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+      const open = btn.dataset.open || '0', material = btn.dataset.material || '0';
+      const msg = 'Close out this engagement?\n\n' +
+        `- ${open} open request(s) will be FROZEN as "Unfulfilled at report date" (not deleted, not waived).\n` +
+        `- ${material} of them ${material === '1' ? 'is' : 'are'} material: the EQR readiness gate will show ${material === '0' ? 'PASSED' : 'BLOCKED'}.\n` +
+        '- Accepted, waived and not-applicable requests keep their state.\n' +
+        '- The engagement becomes READ-ONLY: no new requests, events or uploads.\n\n' +
+        'This cannot be undone.';
+      if (!confirm(msg)) return;
+      btn.disabled = true;
+      const fd = new FormData();
+      fd.set('actor', actor);
+      let data = {};
+      const res = await fetch(`/engagements/${btn.dataset.closeout}/close`, { method: 'POST', body: fd });
+      try { data = await res.json(); } catch (x) {}
+      if (!res.ok) { btn.disabled = false; alert(data.error || 'Could not close the engagement.'); return; }
+      location.href = data.closeout_url || `/engagements/${btn.dataset.closeout}/close-out`;
+    });
+  </script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

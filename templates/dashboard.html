@@ -39,21 +39,23 @@
       <h2 class="text-xl font-semibold text-slate-900">{{ selected.name }}</h2>
       <p class="text-sm text-slate-500">
         {{ selected.client_name }} · {{ selected.engagement_type }} · {{ selected.period_from|fdate }} to {{ selected.period_to|fdate }}
-        {% if selected.status == 'Closed' %} · <span class="font-medium text-slate-700">Closed, report date {{ selected.report_date|fdate }}</span>{% endif %}
+        {% if selected.status == 'Closed' %} · <span class="font-medium text-slate-700">Closed {{ selected.closed_at|ist }}, report date {{ selected.report_date|fdate }} · read-only</span>{% endif %}
       </p>
     </div>
-    {% if selected.status == 'Active' %}
     <div class="flex flex-wrap gap-2">
+      <a href="/engagements/{{ selected.id }}/close-out"
+         class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Close-out &amp; evidence</a>
+    {% if selected.status == 'Active' %}
       <button id="open-profile" type="button" data-engagement="{{ selected.id }}"
               class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Entity profile</button>
       <button id="open-requirements" type="button" data-engagement="{{ selected.id }}"
               class="rounded-md border border-sky-600 bg-sky-50 px-3 py-2 text-sm font-medium text-sky-800 hover:bg-sky-100">Requirement list</button>
-      <button id="close-engagement" type="button" data-engagement="{{ selected.id }}"
-              class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Close out engagement</button>
+      <button id="close-engagement" type="button" data-closeout="{{ selected.id }}" data-open="{{ stats.open_material + stats.open_routine }}" data-material="{{ stats.open_material }}"
+              class="rounded-md border border-rose-300 bg-white px-3 py-2 text-sm font-medium text-rose-800 hover:bg-rose-50">Close out engagement</button>
       <button id="open-modal" type="button"
               class="rounded-md bg-slate-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-slate-700">+ New request</button>
-    </div>
     {% endif %}
+    </div>
   </div>
 
   {# ---- Day-forty summary ---- #}
@@ -778,22 +780,6 @@
     if (boardPanel && !boardPanel.classList.contains('hidden')) setTimeout(() => loadBoard(), 900);
   });
 
-  // ---------- Close-out ----------
-  const closeBtn = document.getElementById('close-engagement');
-  if (closeBtn) {
-    closeBtn.addEventListener('click', async () => {
-      const actor = currentActor();
-      if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
-      if (!confirm('Close out this engagement?\n\nEvery request still open will be FROZEN as "Unfulfilled at report date". ' +
-                   'They are not deleted and not waived. This cannot be undone.')) return;
-      const fd = new FormData();
-      fd.set('actor', actor);
-      const res = await fetch(`/engagements/${closeBtn.dataset.engagement}/close`, { method: 'POST', body: fd });
-      const data = await readJson(res);
-      if (!res.ok) { alert(data.error || 'Could not close the engagement.'); return; }
-      location.reload();
-    });
-  }
 })();
 </script>
 {% endblock %}

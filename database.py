@@ -108,6 +108,56 @@ _GUARD_DDL = [
         BEFORE UPDATE OR DELETE ON request
         FOR EACH ROW EXECUTE FUNCTION ledger_block_mutation();
     """,
+    # Stage 5: a closed engagement is read-only at the database too - nothing new may be inserted
+    # against it, and the engagement itself can no longer be changed or deleted.
+    """
+    CREATE OR REPLACE FUNCTION ledger_block_closed() RETURNS trigger AS $$
+    DECLARE eid integer; eng_status text;
+    BEGIN
+        IF TG_TABLE_NAME = 'request' THEN
+            eid := NEW.engagement_id;
+        ELSE
+            SELECT engagement_id INTO eid FROM request WHERE id = NEW.request_id;
+        END IF;
+        SELECT status INTO eng_status FROM engagement WHERE id = eid;
+        IF eng_status = 'Closed' THEN
+            RAISE EXCEPTION 'The engagement is closed - it is read-only'
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    *[
+        stmt
+        for table in ("request", "request_event", "submission")
+        for stmt in (
+            f"DROP TRIGGER IF EXISTS trg_{table}_closed_readonly ON {table};",
+            f"""
+            CREATE TRIGGER trg_{table}_closed_readonly
+                BEFORE INSERT ON {table}
+                FOR EACH ROW EXECUTE FUNCTION ledger_block_closed();
+            """,
+        )
+    ],
+    """
+    CREATE OR REPLACE FUNCTION ledger_block_closed_engagement() RETURNS trigger AS $$
+    BEGIN
+        IF OLD.status = 'Closed' THEN
+            RAISE EXCEPTION 'The engagement is closed - it cannot be changed or reopened'
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    "DROP TRIGGER IF EXISTS trg_engagement_closed_frozen ON engagement;",
+    """
+    CREATE TRIGGER trg_engagement_closed_frozen
+        BEFORE UPDATE OR DELETE ON engagement
+        FOR EACH ROW EXECUTE FUNCTION ledger_block_closed_engagement();
+    """,
     # Stage 2: templates are versioned and immutable; suppression records are append-only.
     *[
         stmt
@@ -132,6 +182,12 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS ix_request_template_item_id ON request (template_item_id)",
     # Stage 3 adds the ARRIVAL_RECORDED event type, so the CHECK on request_event.event_type is
     # rebuilt from the current list. (DDL only - the append-only triggers guard rows, not schema.)
+    # Stage 5: when the engagement was closed. Engagements closed earlier get the time of their
+    # last recorded event (or the report date) - this runs before the freeze trigger is installed.
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ",
+    "UPDATE engagement SET closed_at = COALESCE("
+    "(SELECT max(e.at) FROM request_event e JOIN request r ON r.id = e.request_id WHERE r.engagement_id = engagement.id), "
+    "CAST(report_date AS TIMESTAMPTZ), now()) WHERE status = 'Closed' AND closed_at IS NULL",
     "ALTER TABLE request_event DROP CONSTRAINT IF EXISTS ck_request_event_type",
     "ALTER TABLE request_event ADD CONSTRAINT ck_request_event_type CHECK (event_type IN ({event_types}))",
 ]

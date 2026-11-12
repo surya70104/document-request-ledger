@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ 'SA 705 extract' if doc == 'sa705' else 'SA 580 schedule' }} - {{ eng.name }}</title>
+  <style>
+    :root { --ink:#0f172a; --muted:#475569; --faint:#64748b; --rule:#cbd5e1; --soft:#f1f5f9; --bg:#e2e8f0; }
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body { margin:0; color:var(--ink); font:13.5px/1.55 "Segoe UI", Inter, system-ui, Arial, sans-serif; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+    .toolbar { position:sticky; top:0; display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 20px; background:#0f172a; color:#e2e8f0; }
+    .toolbar a, .toolbar button { font:inherit; font-weight:600; border:0; border-radius:6px; padding:7px 14px; background:#f8fafc; color:#0f172a; text-decoration:none; cursor:pointer; }
+    .toolbar span { color:#94a3b8; font-size:12px; }
+    .sheet { max-width:880px; margin:18px auto; padding:40px 48px 52px; background:#fff; box-shadow:0 2px 14px rgba(15,23,42,.18); }
+    .firm { display:flex; justify-content:space-between; align-items:flex-end; border-bottom:3px double var(--ink); padding-bottom:8px; }
+    .firm h1 { margin:0; font-size:19px; }
+    .firm .sub { color:var(--muted); font-size:12px; text-align:right; }
+    h2 { font-size:16px; margin:22px 0 6px; }
+    .draft { display:inline-block; margin-left:8px; padding:1px 8px; border:1px solid #b45309; color:#b45309; border-radius:999px; font-size:11px; font-weight:700; vertical-align:middle; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; }
+    th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--faint); border-bottom:1px solid var(--ink); padding:6px 8px; }
+    td { padding:7px 8px; border-bottom:1px solid var(--rule); vertical-align:top; }
+    tr { page-break-inside:avoid; break-inside:avoid; }
+    ol.items { padding-left:0; list-style:none; }
+    ol.items li { margin:6px 0; padding-left:2.2em; text-indent:-2.2em; }
+    .note { margin-top:18px; padding:9px 12px; background:var(--soft); border:1px solid var(--rule); font-size:12px; color:var(--muted); }
+    .sign { display:flex; gap:40px; margin-top:44px; }
+    .sign div { flex:1; border-top:1px solid var(--ink); padding-top:4px; color:var(--faint); font-size:11px; }
+    .foot { margin-top:18px; color:var(--faint); font-size:11px; }
+    @page { size:A4; margin:16mm 14mm 18mm; }
+    @media print { html, body { background:#fff; } .toolbar { display:none; } .sheet { max-width:none; margin:0; padding:0; box-shadow:none; } thead { display:table-header-group; } .note { background:#fff; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <a href="/engagements/{{ eng.id }}/close-out">&larr; Back to close-out</a>
+    <span>Print &rarr; "Save as PDF" for the file you attach.</span>
+    <button type="button" onclick="window.print()">Print / Save as PDF</button>
+  </div>
+  <div class="sheet">
+    <div class="firm">
+      <h1>{{ firm_name }}</h1>
+      <div class="sub">{{ eng.client_name }}<br>{{ eng.name }} · report date {{ rep.report_date|fdate }}</div>
+    </div>
+
+    {% if doc == 'sa705' %}
+      {% set x = rep.sa705 %}
+      <h2>{{ x.heading }}{% if rep.preview %}<span class="draft">PREVIEW - engagement not closed</span>{% endif %}</h2>
+      {% if x.has_limitation %}
+        <p>{{ x.intro }}</p>
+        <ol class="items">{% for line in x.lines %}<li>{{ line }}</li>{% endfor %}</ol>
+        <p>{{ x.conclusion }}</p>
+      {% endif %}
+      <div class="note">{{ x.drafting_note }}</div>
+    {% else %}
+      {% set x = rep.sa580 %}
+      <h2>Schedule of documents requested and not provided{% if rep.preview %}<span class="draft">PREVIEW - engagement not closed</span>{% endif %}</h2>
+      <p style="color:var(--muted);margin-top:0">Annexure to the management representation letter (SA 580)</p>
+      <p>{{ x.preamble }}</p>
+      <p>{{ x.statement }}</p>
+      {% if x.rows %}
+      <table>
+        <thead><tr><th>No.</th><th>Ref</th><th>Document</th><th>Period</th><th>Client owner</th><th>Significance</th><th>Requested</th><th>Chases</th></tr></thead>
+        <tbody>
+          {% for r in x.rows %}
+          <tr><td>{{ loop.index }}</td><td>{{ r.ref }}</td><td>{{ r.document }}</td><td>{{ r.period }}</td><td>{{ r.owner }}</td><td>{{ r.significance }}</td><td>{{ r.requested_on|fdate }}</td><td>{{ r.chases }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      <div class="sign">
+        <div>For {{ eng.client_name }} - name and designation</div>
+        <div>Signature</div>
+        <div>Date</div>
+      </div>
+    {% endif %}
+    <p class="foot">Generated {{ rep.now|ist }}{% if exported_by %} by {{ exported_by }}{% endif %} · {{ firm_name }} · {{ eng.name }}{% if rep.closed %} · closed {{ eng.closed_at|ist }}{% endif %}</p>
+  </div>
+</body>
+</html>
