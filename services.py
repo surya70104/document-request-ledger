@@ -6,6 +6,7 @@ history is INSERT a `request_event` row. There is no update or delete of events 
 import hashlib
 import json
 import os
+import uuid
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 import emailer
+import whatsapp
 from conditions import (
     CRORE,
     PROFILE_FIELDS,
@@ -28,6 +30,7 @@ from models import (
     Chase,
     ClientToken,
     OutboundEmail,
+    WhatsAppMessage,
     REASON_CODE_ALIASES,
     Submission,
     SubmissionFile,
@@ -510,14 +513,19 @@ def record_submission(
     session: Session,
     request_id: int,
     actor: str,
-    files: list[tuple[str, bytes]],
+    files: list[tuple],
     *,
     channel: str = "Web upload",
     submitted_by: Optional[str] = None,
     at: Optional[datetime] = None,
     upload_dir: Optional[Path] = None,
+    note: Optional[str] = None,
 ) -> dict:
     """Record what arrived against a request.
+
+    `files` are (name, bytes) or (name, bytes, arrived_at): a file may carry its own arrival time
+    (WhatsApp photos arrive one by one). The submission's received_at is the first arrival, each
+    arrival row keeps its own time, and the ledger events are stamped with the last arrival.
 
     Each file is hashed (SHA-256). A file whose hash already exists for THIS request is not stored
     again: an Arrival row ("identical content arrived again") and an ARRIVAL_RECORDED event are
@@ -530,12 +538,16 @@ def record_submission(
     if channel not in CHANNELS:
         raise LedgerError(f"Unknown channel '{channel}'. Use one of: {', '.join(CHANNELS)}.")
     submitted_by = _clean(submitted_by)
+    note = _clean(note)
     at = _aware(at)
     base = Path(upload_dir) if upload_dir else UPLOAD_DIR
 
     if not files:
         raise LedgerError("Choose at least one file to submit.")
-    for name, data in files:
+    norm = [(item[0], item[1], _aware(item[2]) if len(item) > 2 and item[2] else at) for item in files]
+    first_at = min(t for *_, t in norm)
+    at = max(t for *_, t in norm)  # the ledger events are stamped when the last file had arrived
+    for name, data, _t in norm:
         if not data:
             raise LedgerError(f"'{_safe_name(name)}' is empty.")
         if len(data) > MAX_UPLOAD_BYTES:
@@ -553,12 +565,12 @@ def record_submission(
         known: dict[str, SubmissionFile] = {sf.content_hash: sf for sub in req.submissions for sf in sub.files}
         seen = set(known)
         plan = []
-        for name, data in files:
+        for name, data, when_ in norm:
             digest = sha256_hex(data)
-            plan.append((name, data, digest, digest in seen))
+            plan.append((name, data, digest, digest in seen, when_))
             seen.add(digest)
 
-        if any(not dup for *_, dup in plan):
+        if any(not item[3] for item in plan):
             if state not in SUBMITTABLE_STATES:
                 raise InvalidTransition(
                     f"New content cannot be submitted while the request is '{state}'. "
@@ -569,13 +581,13 @@ def record_submission(
         new_files: list[SubmissionFile] = []
         arrivals: list[SubmissionFile] = []
         page = 0
-        for name, data, digest, is_dup in plan:
+        for name, data, digest, is_dup, when_ in plan:
             if not is_dup:
                 if submission is None:
                     submission = Submission(
                         request_id=req.id,
                         attempt_number=req.attempt_count,
-                        received_at=at,
+                        received_at=first_at,
                         channel=channel,
                         submitted_by=submitted_by,
                         outcome="pending",
@@ -605,7 +617,7 @@ def record_submission(
             else:
                 sf = known[digest]
                 sf.arrivals.append(
-                    Arrival(arrived_at=at, channel=channel, submitted_by=submitted_by)
+                    Arrival(arrived_at=when_, channel=channel, submitted_by=submitted_by)
                 )
                 session.flush()
                 arrivals.append(sf)
@@ -621,6 +633,7 @@ def record_submission(
                         "submission_id": submission.id,
                         "attempt": submission.attempt_number,
                         **({"submitted_by": submitted_by} if submitted_by else {}),
+                        **({"note": note} if note else {}),
                         "files": [f"{f.filename} (sha256 {f.content_hash[:12]}...)" for f in new_files],
                     },
                     at,
@@ -1359,7 +1372,10 @@ def record_chase(
     deliver = None
     if channel == "Email":
         deliver = _email_chase_hook(session, note, actor) if notify else _delivered_hook
+    elif channel == "WhatsApp" and notify:
+        deliver = _whatsapp_chase_hook(session, note, actor)
     eng, document = req.engagement, req.document
+    wa_to = whatsapp_number_for(eng, req) if channel == "WhatsApp" else None
     try:
         events = append_event(
             session, request_id, E.CHASED, actor,
@@ -1372,6 +1388,11 @@ def record_chase(
             body=note, created_by=actor, error=str(exc), engagement_id=eng.id,
         )
         raise LedgerError(f"{exc} The chase was not recorded.") from exc
+    except whatsapp.WhatsAppDeliveryError as exc:
+        session.rollback()
+        _record_whatsapp_failure(session, to=wa_to or "", body=note, kind="chase", created_by=actor,
+                                 engagement_id=eng.id, request_id=request_id, error=str(exc))
+        raise LedgerError(f"The WhatsApp message could not be sent: {exc} The chase was not recorded.") from exc
     req = get_request(session, request_id)
     chase = session.execute(select(Chase).where(Chase.event_id == events[0].id)).scalar_one()
     return {
@@ -1381,6 +1402,8 @@ def record_chase(
         "request": req,
         "emailed": chase.email_id is not None,
         "no_client_email": channel == "Email" and notify and not eng.client_email,
+        "whatsapped": chase.whatsapp_id is not None,
+        "no_client_whatsapp": channel == "WhatsApp" and notify and not wa_to,
     }
 
 
@@ -1900,6 +1923,9 @@ def _valid_email(value: Optional[str], label: str) -> Optional[str]:
     return value.lower() if value else None
 
 
+_UNSET = object()
+
+
 def update_engagement_settings(
     session: Session,
     engagement_id: int,
@@ -1908,11 +1934,26 @@ def update_engagement_settings(
     partner_email: Optional[str] = None,
     age_warn_days: Optional[int] = None,
     age_escalate_days: Optional[int] = None,
+    client_whatsapp=_UNSET,
+    whatsapp_contacts=_UNSET,
 ) -> Engagement:
     """Who the client link and reminders are emailed to, who escalations go to, and the ageing
     thresholds (amber warning / partner escalation, in days outstanding)."""
     client_email = _valid_email(client_email, "client")
     partner_email = _valid_email(partner_email, "partner")
+    wa_number, wa_contacts = None, {}
+    if client_whatsapp is not _UNSET and _clean(client_whatsapp):
+        wa_number = whatsapp.normalise_phone(client_whatsapp)
+        if not wa_number:
+            raise LedgerError(f"'{_clean(client_whatsapp)}' is not a valid WhatsApp number.")
+    if whatsapp_contacts is not _UNSET:
+        for who, raw in (whatsapp_contacts or {}).items():
+            if not _clean(who) or not _clean(raw):
+                continue
+            number = whatsapp.normalise_phone(raw)
+            if not number:
+                raise LedgerError(f"'{_clean(raw)}' is not a valid WhatsApp number (for {_clean(who)}).")
+            wa_contacts[_clean(who).lower()] = number
     try:
         warn = int(age_warn_days if age_warn_days not in (None, "") else AGE_WARN_DAYS)
         crit = int(age_escalate_days if age_escalate_days not in (None, "") else AGE_CRIT_DAYS)
@@ -1926,6 +1967,10 @@ def update_engagement_settings(
             raise LedgerError("This engagement is closed; its settings are frozen.")
         eng.client_email = client_email
         eng.partner_email = partner_email
+        if client_whatsapp is not _UNSET:
+            eng.client_whatsapp = wa_number
+        if whatsapp_contacts is not _UNSET:
+            eng.whatsapp_contacts = wa_contacts  # a new dict, so the JSONB change is detected
         eng.age_warn_days = warn
         eng.age_escalate_days = crit
         session.commit()
@@ -2265,19 +2310,9 @@ def client_report_unavailable(
         raise LedgerError("That explanation is too long (1000 characters maximum).")
     token, eng, req = _client_request(session, token_str, request_id)
     name = _clean(submitted_by)
-    try:
-        locked = _lock_request(session, request_id)
-        if locked.state not in SUBMITTABLE_STATES or locked.engagement.status != "Active":
-            raise InvalidTransition(f"This request cannot be answered now (it is '{locked.state}').")
-        event = _insert_event(
-            session, locked, E.CLIENT_UNAVAILABLE, f"{name} (client)" if name else CLIENT_ACTOR,
-            "Tokenised link", {"reason": reason}, utcnow(),
-        )
-        session.commit()
-        return event
-    except Exception:
-        session.rollback()
-        raise
+    return _record_unavailable(
+        session, request_id, reason, f"{name} (client)" if name else CLIENT_ACTOR, "Tokenised link"
+    )
 
 
 # ---- batch release -----------------------------------------------------------------------------
@@ -2288,22 +2323,32 @@ def _request_lines(reqs: list[Request]) -> str:
     return "\n".join(lines)
 
 
-def release_requests(session: Session, engagement_id: int, request_ids: list[int], actor: str) -> dict:
+def release_requests(
+    session: Session, engagement_id: int, request_ids: list[int], actor: str, channel: str = "Email"
+) -> dict:
     """Release several Drafted requests to the client together. In ONE transaction: a SENT event for
-    each (channel Email), the engagement's client link is created if needed, and one email listing
-    the requests with the link is sent (or logged in the Outbox). If any request is not Drafted, or
-    the email cannot be sent, nothing is released."""
+    each (on `channel`: Email or WhatsApp), the engagement's client link is created if needed, and
+    ONE message listing the requests with the link goes out - an email (or a logged Outbox email), or
+    a WhatsApp message (or a simulated one). If any request is not Drafted, or the message cannot be
+    sent, nothing is released."""
     actor = _require_actor(actor)
+    channel = _clean(channel) or "Email"
+    if channel not in ("Email", "WhatsApp"):
+        raise LedgerError("Requests are released by Email or WhatsApp.")
     ids = list(dict.fromkeys(int(i) for i in request_ids))
     if not ids:
         raise LedgerError("Tick at least one Drafted request to release.")
-    mail_args = {}
+    mail_args, wa_args = {}, {}
+    mail = msg = None
     try:
         eng = _lock_engagement(session, engagement_id)
         if eng.status != "Active":
             raise LedgerError("This engagement is closed; nothing can be released.")
-        if not eng.client_email:
+        number = whatsapp_number_for(eng)
+        if channel == "Email" and not eng.client_email:
             raise LedgerError("Set the client's email address first (Settings) - the release email goes there.")
+        if channel == "WhatsApp" and not number:
+            raise LedgerError("Set the client's WhatsApp number first (Settings) - the release message goes there.")
         reqs, problems = [], []
         for rid in ids:
             req = _lock_request(session, rid)
@@ -2317,30 +2362,41 @@ def release_requests(session: Session, engagement_id: int, request_ids: list[int
             raise LedgerError("Nothing was released: " + "; ".join(problems) + ".")
 
         token = _ensure_token(session, eng, actor)
+        link = emailer.client_link_url(token.token)
         at = utcnow()
+        how = (f"by email ({eng.client_email})" if channel == "Email" else f"on WhatsApp ({number})")
         for req in reqs:
-            _insert_event(session, req, E.SENT, actor, "Email",
-                          {"note": f"Released to the client by email ({eng.client_email}) with the upload link."}, at)
-        body = (
-            f"Dear {eng.client_name} team,\n\n"
-            f"We have released {len(reqs)} document request{'s' if len(reqs) != 1 else ''} for {eng.name}. "
-            f"Please upload them using the link below - no login or password is needed, and it works "
-            f"from a phone.\n\n{emailer.client_link_url(token.token)}\n\n"
-            f"The link is valid until {token.expires_at.strftime('%d %B %Y')}.\n\n"
-            f"Requests, in the order we would like them:\n{_request_lines(reqs)}\n\n"
-            f"Thank you,\n{actor}\n"
-        )
-        subject = f"{len(reqs)} document request{'s' if len(reqs) != 1 else ''} - {eng.name}"
-        mail_args = dict(kind="request_batch", to_address=eng.client_email, subject=subject, body=body,
-                         created_by=actor, engagement_id=eng.id, token_id=token.id)
-        mail = emailer.dispatch(session, **mail_args)
+            _insert_event(session, req, E.SENT, actor, channel,
+                          {"note": f"Released to the client {how} with the upload link."}, at)
+        if channel == "Email":
+            body = (
+                f"Dear {eng.client_name} team,\n\n"
+                f"We have released {len(reqs)} document request{'s' if len(reqs) != 1 else ''} for {eng.name}. "
+                f"Please upload them using the link below - no login or password is needed, and it works "
+                f"from a phone.\n\n{link}\n\n"
+                f"The link is valid until {token.expires_at.strftime('%d %B %Y')}.\n\n"
+                f"Requests, in the order we would like them:\n{_request_lines(reqs)}\n\n"
+                f"Thank you,\n{actor}\n"
+            )
+            subject = f"{len(reqs)} document request{'s' if len(reqs) != 1 else ''} - {eng.name}"
+            mail_args = dict(kind="request_batch", to_address=eng.client_email, subject=subject, body=body,
+                             created_by=actor, engagement_id=eng.id, token_id=token.id)
+            mail = emailer.dispatch(session, **mail_args)
+        else:
+            wa_args = dict(to=number, body=compose_whatsapp_batch(eng, reqs, link), kind="request_batch",
+                           created_by=actor, engagement_id=eng.id)
+            msg = _send_whatsapp(session, **wa_args)
         session.commit()
-        return {"released": [r.ref for r in reqs], "email": mail, "token": token,
-                "link": emailer.client_link_url(token.token)}
+        return {"released": [r.ref for r in reqs], "email": mail, "whatsapp": msg, "channel": channel,
+                "token": token, "link": link}
     except emailer.EmailDeliveryError as exc:
         session.rollback()
         emailer.record_failure(session, error=str(exc), **{k: v for k, v in mail_args.items() if k != "token_id"})
         raise LedgerError(f"{exc} Nothing was released.") from exc
+    except whatsapp.WhatsAppDeliveryError as exc:
+        session.rollback()
+        _record_whatsapp_failure(session, error=str(exc), **wa_args)
+        raise LedgerError(f"The WhatsApp message could not be sent: {exc} Nothing was released.") from exc
     except Exception:
         session.rollback()
         raise
@@ -2560,3 +2616,562 @@ def assemble_submission_pdf(session: Session, submission_id: int) -> tuple[bytes
     writer.write(out)
     req = session.get(Request, sub.request_id)
     return out.getvalue(), f"{req.ref}_attempt{sub.attempt_number}.pdf"
+
+
+# ============================================================================================
+# Pass 2 - the two-way WhatsApp channel
+# ============================================================================================
+WHATSAPP_ASSEMBLY_SECONDS = int(os.getenv("WHATSAPP_ASSEMBLY_SECONDS", "120") or 120)
+WHATSAPP_CONTINUE_SECONDS = 600  # photos sent within this long of an earlier one join the same request
+_REQUEST_REF_RE = re.compile(r"\bREQ-\d{3}-\d{3}\b", re.I)
+_UNAVAILABLE_RE = re.compile(r"\b(i\s*)?(don'?t|dont|do\s+not)\s+have\b|\bnot\s+available\b|\bno\s+record\b", re.I)
+_DONE_RE = re.compile(r"^\s*(done|that'?s all|thats all|finished|sent all|all sent)\W*\s*$", re.I)
+
+
+# ---- numbers ------------------------------------------------------------------------------------
+def whatsapp_number_for(eng: Engagement, req: Optional[Request] = None) -> Optional[str]:
+    """The number to message: the request owner's own number if one is set, else the client's."""
+    if req is not None:
+        key = owner_name_key(req.owner_person)
+        for name, number in (eng.whatsapp_contacts or {}).items():
+            if owner_name_key(name) == key and whatsapp.normalise_phone(number):
+                return whatsapp.normalise_phone(number)
+    return whatsapp.normalise_phone(eng.client_whatsapp)
+
+
+def _sender_contexts(session: Session, phone: str) -> dict[int, tuple[Engagement, Optional[str]]]:
+    """The engagements a number belongs to -> (engagement, owner key or None). The client's own number
+    may answer for any request; an owner's number only for that owner's requests."""
+    out: dict[int, tuple[Engagement, Optional[str]]] = {}
+    for eng in session.execute(select(Engagement)).scalars():
+        if whatsapp.normalise_phone(eng.client_whatsapp) == phone:
+            out[eng.id] = (eng, None)
+            continue
+        for name, number in (eng.whatsapp_contacts or {}).items():
+            if whatsapp.normalise_phone(number) == phone:
+                out[eng.id] = (eng, owner_name_key(name))
+    return out
+
+
+# ---- wording ------------------------------------------------------------------------------------
+def _wa_label(req: Request) -> str:
+    return req.description or req.document
+
+
+def compose_whatsapp_request(req: Request, link: str, note: Optional[str] = None) -> str:
+    """One request, in the client's words: what we need, the period, how to answer (photo/PDF with
+    the code, or the no-login link)."""
+    first = (owner_parts(req.owner_person)[0].split() or [req.owner_person])[0]
+    period = _period_phrase(req.period_from, req.period_to)
+    lines = [note or f"Hi {first}, we need a document for the audit:", "", f"*{_wa_label(req)}*"]
+    if req.period_from or req.period_to:
+        lines.append(period)
+    lines += [
+        "",
+        f"Please reply here with a photo or PDF of it and include the code *{req.ref}* - "
+        f"or use your link (no login needed):",
+        link,
+    ]
+    return "\n".join(lines)
+
+
+def compose_whatsapp_batch(eng: Engagement, reqs: list[Request], link: str) -> str:
+    """The release message: the next few requests, most important first, each with its code."""
+    ordered = sorted(reqs, key=lambda r: (r.priority, 0 if r.significance == "Material" else 1, r.id))
+    shown = ordered[:CLIENT_QUEUE_SIZE]
+    lines = [
+        f"Hi {eng.client_name} team, we have released {len(reqs)} document request{'s' if len(reqs) != 1 else ''} "
+        f"for {eng.name}.",
+        "",
+        "First up, most important first:",
+    ]
+    for i, r in enumerate(shown, start=1):
+        period = _period_phrase(r.period_from, r.period_to)
+        lines.append(f"{i}. {_wa_label(r)}" + (f" ({period})" if r.period_from or r.period_to else "") + f" [{r.ref}]")
+    if len(ordered) > len(shown):
+        lines.append(f"...and {len(ordered) - len(shown)} more, which appear as you finish these.")
+    lines += [
+        "",
+        "Reply here with a photo or PDF and the code in brackets, or use your link (no login needed):",
+        link,
+    ]
+    return "\n".join(lines)
+
+
+# ---- sending ------------------------------------------------------------------------------------
+def _send_whatsapp(
+    session: Session, *, to: str, body: str, kind: str, created_by: str,
+    engagement_id: Optional[int], request_id: Optional[int] = None,
+) -> WhatsAppMessage:
+    """Send (or simulate) one outbound message and add its row to the session (caller commits).
+    Raises WhatsAppDeliveryError when a live provider refuses it."""
+    result = whatsapp.send_text(to, body)
+    msg = WhatsAppMessage(
+        direction="out", kind=kind, phone=to, body=body,
+        status="simulated" if result["mode"] == "simulated" else "sent",
+        engagement_id=engagement_id, request_id=request_id, provider_message_id=result["id"],
+        created_by=created_by, created_at=utcnow(),
+    )
+    session.add(msg)
+    session.flush()
+    return msg
+
+
+def _record_whatsapp_failure(
+    session: Session, *, to: str, body: str, kind: str, created_by: str,
+    engagement_id: Optional[int], error: str, request_id: Optional[int] = None,
+) -> None:
+    session.add(WhatsAppMessage(
+        direction="out", kind=kind, phone=to, body=body, status="failed", engagement_id=engagement_id,
+        request_id=request_id, created_by=created_by, note=error[:2000], created_at=utcnow(),
+    ))
+    session.commit()
+
+
+def _auto_reply(session: Session, *, phone: str, body: str, engagement_id: Optional[int],
+                request_id: Optional[int] = None, marker: Optional[str] = None) -> Optional[WhatsAppMessage]:
+    """The ledger answers the client on WhatsApp. Best effort: a failure is recorded, never raised."""
+    try:
+        msg = _send_whatsapp(session, to=phone, body=body, kind="auto_reply", created_by="Ledger (auto-reply)",
+                             engagement_id=engagement_id, request_id=request_id)
+        msg.note = marker
+        session.commit()
+        return msg
+    except whatsapp.WhatsAppDeliveryError as exc:
+        session.rollback()
+        _record_whatsapp_failure(session, to=phone, body=body, kind="auto_reply", created_by="Ledger (auto-reply)",
+                                 engagement_id=engagement_id, request_id=request_id, error=str(exc))
+        return None
+
+
+def _whatsapp_chase_hook(session: Session, note: str, actor: str):
+    """Send the reminder on WhatsApp (to the owner's own number when there is one) with the code and
+    the owner's link, inside the chase's transaction."""
+
+    def hook(req: Request, ev: RequestEvent, chase: Chase) -> None:
+        eng = req.engagement
+        to = whatsapp_number_for(eng, req)
+        if not to:
+            return  # no number: recorded as made by hand, not delivered by the system
+        token = _link_token_for(session, eng, req, actor)
+        msg = _send_whatsapp(
+            session, to=to, body=compose_whatsapp_request(req, emailer.client_link_url(token.token), note),
+            kind="chase", created_by=actor, engagement_id=eng.id, request_id=req.id,
+        )
+        chase.delivered = True
+        chase.delivered_at = msg.created_at
+        chase.whatsapp_id = msg.id
+
+    return hook
+
+
+# ---- inbound ------------------------------------------------------------------------------------
+def _event_at(req: Request, at: datetime) -> datetime:
+    """A client's message is stamped when it arrived, but never earlier than the request's last event."""
+    last = req.events[-1].at if req.events else at
+    return max(_aware(at), _aware(last))
+
+
+def _save_whatsapp_media(media: list[tuple]) -> list[dict]:
+    items = []
+    folder = uuid.uuid4().hex
+    for n, (filename, content_type, data) in enumerate(media, start=1):
+        safe = _safe_name(filename or f"file-{n}")
+        if not data:
+            raise LedgerError(f"'{safe}' is empty.")
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise LedgerError(f"'{safe}' is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+        rel = f"whatsapp/{folder}/{n}_{safe}"
+        path = UPLOAD_DIR / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        items.append({"filename": safe, "content_type": content_type or "application/octet-stream",
+                      "path": rel, "sha256": sha256_hex(data), "size": len(data)})
+    return items
+
+
+def _match_whatsapp_request(session: Session, msg: WhatsAppMessage, contexts: dict) -> tuple[Optional[Request], str]:
+    """Which request a message answers - EXPLICITLY, never by guessing from content:
+    1. it is a reply to one of our messages about a single request;
+    2. it carries the request's code (REQ-001-002);
+    3. it continues a run of photos already being assembled for a request.
+    Anything else is left unmatched for a person to assign."""
+    if msg.reply_to_provider_id:
+        out = session.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.direction == "out",
+                                          WhatsAppMessage.provider_message_id == msg.reply_to_provider_id)
+        ).scalars().first()
+        if out and out.request_id:
+            req = session.get(Request, out.request_id)
+            if req and req.engagement_id in contexts:
+                return req, "reply"
+    refs = {r.upper() for r in _REQUEST_REF_RE.findall(msg.body or "")}
+    if refs:
+        found = session.execute(
+            select(Request).where(Request.ref.in_(refs), Request.engagement_id.in_(list(contexts)))
+        ).scalars().all()
+        if len(found) == 1:
+            return found[0], "code"
+        if len(found) > 1:
+            return None, "several codes - which one?"
+    last = session.execute(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.direction == "in", WhatsAppMessage.phone == msg.phone,
+            WhatsAppMessage.status == "buffered", WhatsAppMessage.request_id.is_not(None),
+            WhatsAppMessage.id != msg.id,
+            WhatsAppMessage.created_at >= _aware(msg.created_at) - timedelta(seconds=WHATSAPP_CONTINUE_SECONDS),
+        ).order_by(WhatsAppMessage.id.desc())
+    ).scalars().first()
+    if last:
+        return session.get(Request, last.request_id), "continued"
+    return None, "no code or reply"
+
+
+def _open_requests_for(session: Session, contexts: dict) -> list[Request]:
+    out = []
+    for eng_id, (eng, scope) in contexts.items():
+        if eng.status != "Active":
+            continue
+        for r in engagement_requests(session, eng_id):
+            if r.state in SUBMITTABLE_STATES and (scope is None or owner_name_key(r.owner_person) == scope):
+                out.append(r)
+    return sorted(out, key=lambda r: (r.priority, 0 if r.significance == "Material" else 1, r.id))
+
+
+def _ask_which_request(session: Session, msg: WhatsAppMessage, contexts: dict) -> None:
+    """Politely ask which document a message is for - at most once every ten minutes per number."""
+    recent = session.execute(
+        select(WhatsAppMessage.id).where(
+            WhatsAppMessage.direction == "out", WhatsAppMessage.phone == msg.phone,
+            WhatsAppMessage.note == "which_request",
+            WhatsAppMessage.created_at >= utcnow() - timedelta(minutes=10),
+        ).limit(1)
+    ).first()
+    if recent:
+        return
+    open_ = _open_requests_for(session, contexts)[:CLIENT_QUEUE_SIZE]
+    lines = ["Thanks - we received your message, but we need to know which document it is for."]
+    if open_:
+        lines += ["Please send it again with the code in brackets:", ""]
+        lines += [f"{i}. {_wa_label(r)} [{r.ref}]" for i, r in enumerate(open_, start=1)]
+    else:
+        lines.append("Nothing is waiting on you at the moment.")
+    _auto_reply(session, phone=msg.phone, body="\n".join(lines), engagement_id=msg.engagement_id, marker="which_request")
+
+
+def _record_unavailable(
+    session: Session, request_id: int, reason: str, actor: str, channel: str, at: Optional[datetime] = None
+) -> RequestEvent:
+    """Append CLIENT_REPORTED_UNAVAILABLE ("I don't have this") on `channel`."""
+    try:
+        locked = _lock_request(session, request_id)
+        if locked.state not in SUBMITTABLE_STATES or locked.engagement.status != "Active":
+            raise InvalidTransition(f"This request cannot be answered now (it is '{locked.state}').")
+        event = _insert_event(
+            session, locked, E.CLIENT_UNAVAILABLE, actor, channel, {"reason": reason},
+            _event_at(locked, at or utcnow()),
+        )
+        session.commit()
+        return event
+    except Exception:
+        session.rollback()
+        raise
+
+
+def receive_whatsapp(
+    session: Session,
+    *,
+    phone: str,
+    text: Optional[str] = None,
+    media: Optional[list[tuple]] = None,
+    reply_to: Optional[str] = None,
+    provider_message_id: Optional[str] = None,
+    received_at: Optional[datetime] = None,
+    name: Optional[str] = None,
+    final: bool = False,
+) -> dict:
+    """One inbound WhatsApp message from a client. `media` is [(filename, content_type, bytes), ...] in
+    the order the client sent them. The message is stored first (with the exact arrival time), then:
+
+      * from a number we do not know          -> stored, no reply
+      * matched to a request (reply / code)   -> a Sent request becomes Acknowledged; photos/PDFs are
+            buffered and assembled, in order, into ONE submission (channel WhatsApp) once the client is
+            done (`final`, "done", or a quiet period); "I don't have this" appends
+            CLIENT_REPORTED_UNAVAILABLE; any other text is recorded as a note
+      * not matched                           -> stored as unmatched and the client is asked which
+            document it is for; staff can assign it by hand.
+    Retried webhook deliveries (same provider message id) are ignored."""
+    number = whatsapp.normalise_phone(phone)
+    if not number:
+        raise LedgerError("That is not a valid phone number.")
+    if provider_message_id:
+        again = session.execute(
+            select(WhatsAppMessage).where(WhatsAppMessage.direction == "in",
+                                          WhatsAppMessage.provider_message_id == provider_message_id)
+        ).scalars().first()
+        if again:
+            return {"message": again, "status": again.status, "duplicate_delivery": True}
+    contexts = _sender_contexts(session, number)
+    try:
+        msg = WhatsAppMessage(
+            direction="in", kind="inbound", phone=number, body=_clean(text), status="received",
+            media=_save_whatsapp_media(media or []),
+            created_at=_aware(received_at), provider_message_id=provider_message_id,
+            reply_to_provider_id=_clean(reply_to), sender_name=_clean(name),
+            engagement_id=next(iter(contexts)) if len(contexts) == 1 else None,
+        )
+        session.add(msg)
+        session.flush()
+        if not contexts:
+            msg.status = "unknown_sender"
+            msg.note = "This number is not linked to any engagement."
+            session.commit()
+            return {"message": msg, "status": msg.status}
+
+        # "done" after a run of photos: assemble what has been sent so far
+        if not msg.media and msg.body and _DONE_RE.match(msg.body):
+            pending = session.execute(
+                select(WhatsAppMessage).where(
+                    WhatsAppMessage.direction == "in", WhatsAppMessage.phone == number,
+                    WhatsAppMessage.status == "buffered", WhatsAppMessage.request_id.is_not(None),
+                ).order_by(WhatsAppMessage.id.desc())
+            ).scalars().first()
+            if pending:
+                msg.status = "noted"
+                msg.request_id = pending.request_id
+                msg.note = "Told us they have sent everything."
+                session.commit()
+                flushed = flush_whatsapp_batches(session, force=True, only=(pending.request_id, number))
+                return {"message": session.get(WhatsAppMessage, msg.id), "status": "noted", "assembled": flushed}
+
+        req, how = _match_whatsapp_request(session, msg, contexts)
+        if req is not None:
+            scope = contexts[req.engagement_id][1]
+            if scope is not None and owner_name_key(req.owner_person) != scope:
+                req, how = None, "that request belongs to someone else"
+        if req is None:
+            msg.status = "unmatched"
+            msg.note = how
+            session.commit()
+            _ask_which_request(session, msg, contexts)
+            return {"message": session.get(WhatsAppMessage, msg.id), "status": "unmatched", "reason": how}
+        msg.request_id = req.id
+        msg.engagement_id = req.engagement_id
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    _process_whatsapp(session, msg.id, req.id, final=final)
+    session.expire_all()
+    done = session.get(WhatsAppMessage, msg.id)
+    return {"message": done, "status": done.status, "request_id": req.id, "matched_by": how}
+
+
+def _process_whatsapp(session: Session, message_id: int, request_id: int, *, final: bool = False) -> None:
+    """Act on a message that has been matched to a request."""
+    msg = session.get(WhatsAppMessage, message_id)
+    req = get_request(session, request_id)
+    eng = req.engagement
+    who = msg.sender_name or msg.phone
+    actor = f"{who} (client)"
+    text = (msg.body or "").strip()
+    has_media = bool(msg.media)
+    label = _wa_label(req)
+
+    def reply(body: str) -> None:
+        _auto_reply(session, phone=msg.phone, body=body, engagement_id=eng.id, request_id=req.id)
+
+    def ignore(why: str, tell: str) -> None:
+        msg.status, msg.note = "ignored", why
+        session.commit()
+        reply(tell)
+
+    if eng.status != "Active":
+        return ignore("The engagement is closed.", "Thank you - this engagement is closed, so we can no longer receive documents here.")
+    state = req.state
+    if state in TERMINAL_STATES or state == "Drafted":
+        return ignore(f"The request is {state}.", f"Thanks - we are not waiting for {label} any more.")
+
+    acked = False
+    if state == "Sent":  # seen and replied: acknowledge first
+        note = (f"Replied on WhatsApp: {text}" if text else
+                f"Replied on WhatsApp with {len(msg.media)} file{'s' if len(msg.media) != 1 else ''}.")[:500]
+        append_event(session, req.id, E.ACKNOWLEDGED, actor, channel="WhatsApp", payload={"note": note},
+                     at=_event_at(req, msg.created_at))
+        msg = session.get(WhatsAppMessage, message_id)
+        req = get_request(session, request_id)
+        state, acked = "Acknowledged", True
+
+    if not has_media and (_UNAVAILABLE_RE.search(text)):
+        if state not in SUBMITTABLE_STATES:
+            return ignore(f"The request is {state}.", f"Thanks - {label} is already with us.")
+        _record_unavailable(session, req.id, text, actor, "WhatsApp", msg.created_at)
+        msg = session.get(WhatsAppMessage, message_id)
+        msg.status = "unavailable"
+        session.commit()
+        return reply(f"Thank you - we have noted that you don't have {label}. We will be in touch.")
+
+    if has_media:
+        if state not in SUBMITTABLE_STATES and state not in ("Submitted", "Under review"):
+            return ignore(f"The request is {state}.", f"Thanks - {label} cannot take new files right now.")
+        msg.status = "buffered"
+        session.commit()
+        if final:
+            flush_whatsapp_batches(session, force=True, only=(req.id, msg.phone))
+        return
+
+    # plain text
+    if acked:
+        msg.status = "noted"  # the acknowledgement event already carries the text
+        session.commit()
+        return
+    if text:
+        append_event(session, req.id, E.NOTE, actor, channel="WhatsApp", payload={"note": text[:1000]},
+                     at=_event_at(req, msg.created_at))
+        msg = session.get(WhatsAppMessage, message_id)
+    msg.status = "noted"
+    session.commit()
+
+
+def flush_whatsapp_batches(
+    session: Session,
+    *,
+    now: Optional[datetime] = None,
+    window_seconds: Optional[int] = None,
+    force: bool = False,
+    only: Optional[tuple[int, str]] = None,
+) -> list[dict]:
+    """Assemble buffered WhatsApp photos / files into submissions: for each (request, phone) whose
+    last message is older than the quiet window (or all of them, if `force`), every buffered file
+    - in the order the client sent them - becomes the pages of ONE submission on that request with
+    channel WhatsApp. Each file keeps its own arrival time; identical content already held is an
+    arrival, not a new page (the SHA-256 de-duplication engine runs as for every other channel)."""
+    now = _aware(now)
+    window = WHATSAPP_ASSEMBLY_SECONDS if window_seconds is None else window_seconds
+    buffered = session.execute(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.direction == "in", WhatsAppMessage.status == "buffered",
+            WhatsAppMessage.request_id.is_not(None),
+        ).order_by(WhatsAppMessage.created_at, WhatsAppMessage.id)
+    ).scalars().all()
+    groups: dict[tuple[int, str], list[int]] = {}
+    newest: dict[tuple[int, str], datetime] = {}
+    for m in buffered:
+        key = (m.request_id, m.phone)
+        if only and key != only:
+            continue
+        groups.setdefault(key, []).append(m.id)
+        newest[key] = max(newest.get(key, _aware(m.created_at)), _aware(m.created_at))
+    results = []
+    for key, ids in groups.items():
+        if not force and (now - newest[key]).total_seconds() < window:
+            continue
+        results.append(_assemble_whatsapp_group(session, key[0], key[1], ids))
+    return results
+
+
+def _assemble_whatsapp_group(session: Session, request_id: int, phone: str, ids: list[int]) -> dict:
+    msgs = [session.get(WhatsAppMessage, i) for i in ids]
+    files, captions = [], []
+    for m in sorted(msgs, key=lambda x: (x.created_at, x.id)):
+        for item in m.media:
+            files.append((item["filename"], (UPLOAD_DIR / item["path"]).read_bytes(), m.created_at))
+        if m.body and m.body not in captions:
+            captions.append(m.body)
+    sender = next((m.sender_name for m in msgs if m.sender_name), None) or phone
+    label = _wa_label(session.get(Request, request_id))
+    eng_id = msgs[0].engagement_id
+    try:
+        res = record_submission(
+            session, request_id, f"{sender} (client)", files, channel="WhatsApp", submitted_by=sender,
+            note=" | ".join(captions)[:1000] or None,
+        )
+    except LedgerError as exc:
+        session.rollback()
+        for i in ids:
+            m = session.get(WhatsAppMessage, i)
+            m.status, m.note = "failed", str(exc)[:500]
+        session.commit()
+        _auto_reply(session, phone=phone, body=f"Sorry - we could not file those for {label}: {exc}",
+                    engagement_id=eng_id, request_id=request_id)
+        return {"request_id": request_id, "phone": phone, "status": "failed", "error": str(exc)}
+    sub = res["submission"]
+    for i in ids:
+        m = session.get(WhatsAppMessage, i)
+        m.status = "submitted" if sub else "duplicate"
+        m.submission_id = sub.id if sub else None
+    session.commit()
+    if sub:
+        n = len(res["new_files"])
+        _auto_reply(session, phone=phone, engagement_id=eng_id, request_id=request_id,
+                    body=f"Received {n} page{'s' if n != 1 else ''} for {label} - thank you. We will check it and "
+                         f"only get back to you if something else is needed.")
+    else:
+        _auto_reply(session, phone=phone, engagement_id=eng_id, request_id=request_id,
+                    body=f"We already have that file for {label} - thank you (noted as sent again).")
+    return {"request_id": request_id, "phone": phone, "status": "submitted" if sub else "duplicate",
+            "submission_id": sub.id if sub else None, "pages": len(res["new_files"]), "arrivals": len(res["arrivals"])}
+
+
+def assign_whatsapp_message(session: Session, message_id: int, request_id: int, actor: str) -> dict:
+    """A person tells the ledger which request an unmatched message was for. It is then processed
+    exactly as if the client had sent the code (events are stamped no earlier than the request's
+    last event; the message keeps its true arrival time)."""
+    actor = _require_actor(actor)
+    msg = session.get(WhatsAppMessage, message_id)
+    if msg is None or msg.direction != "in":
+        raise NotFoundError("That WhatsApp message does not exist.")
+    if msg.status != "unmatched":
+        raise LedgerError(f"This message was already handled ({msg.status}).")
+    contexts = _sender_contexts(session, msg.phone)
+    req = session.get(Request, request_id)
+    if req is None or req.engagement_id not in contexts:
+        raise LedgerError("That request is not one this WhatsApp number is linked to.")
+    msg.request_id, msg.engagement_id = req.id, req.engagement_id
+    msg.note = f"Assigned to {req.ref} by {actor}"
+    session.commit()
+    _process_whatsapp(session, msg.id, req.id, final=True)
+    session.expire_all()
+    done = session.get(WhatsAppMessage, message_id)
+    return {"message": done, "status": done.status}
+
+
+# ---- the simulator / inbox screens ------------------------------------------------------------------
+def whatsapp_threads(session: Session) -> list[dict]:
+    """One row per phone number that has a conversation, newest first."""
+    rows: dict[str, dict] = {}
+    for m in session.execute(select(WhatsAppMessage).order_by(WhatsAppMessage.id)).scalars():
+        t = rows.setdefault(m.phone, {"phone": m.phone, "count": 0, "unmatched": 0, "buffered": 0, "last": None})
+        t["count"] += 1
+        t["unmatched"] += 1 if m.status == "unmatched" else 0
+        t["buffered"] += 1 if m.status == "buffered" else 0
+        t["last"] = m
+    for phone, t in rows.items():
+        ctx = _sender_contexts(session, phone)
+        t["who"] = ", ".join(sorted(
+            {(f"{e.client_name} (client)" if scope is None else f"{e.client_name} - {scope.title()}") for e, scope in ctx.values()}
+        )) or "Unknown number"
+    return sorted(rows.values(), key=lambda t: -t["last"].id)
+
+
+def whatsapp_conversation(session: Session, phone: str, limit: int = 300) -> list[WhatsAppMessage]:
+    rows = session.execute(
+        select(WhatsAppMessage).where(WhatsAppMessage.phone == phone).order_by(WhatsAppMessage.id.desc()).limit(limit)
+    ).scalars().all()
+    return list(reversed(rows))
+
+
+def whatsapp_open_requests(session: Session, phone: str) -> list[Request]:
+    return _open_requests_for(session, _sender_contexts(session, phone))
+
+
+def whatsapp_known_numbers(session: Session) -> list[dict]:
+    """Every number the engagements know (client + owners): who the simulator can play."""
+    out = []
+    for eng in session.execute(select(Engagement).order_by(Engagement.id)).scalars():
+        if whatsapp.normalise_phone(eng.client_whatsapp):
+            out.append({"phone": whatsapp.normalise_phone(eng.client_whatsapp), "label": f"{eng.client_name} - client ({eng.name})"})
+        for name, number in (eng.whatsapp_contacts or {}).items():
+            if whatsapp.normalise_phone(number):
+                out.append({"phone": whatsapp.normalise_phone(number), "label": f"{name.title()} ({eng.name})"})
+    return out

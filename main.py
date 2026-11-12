@@ -11,12 +11,19 @@ from typing import Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Query, Request as HttpRequest, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+import asyncio
+import base64
+import json
 
 import emailer
 import services
+import whatsapp
 from database import SessionLocal, ensure_database, init_db
 from conditions import CRORE, PROFILE_FIELDS, ConditionError
 from models import CHANNELS, ENGAGEMENT_TYPES, EVENT_LABEL, REASON_CODES, SIGNIFICANCE, utcnow
@@ -33,7 +40,29 @@ async def lifespan(_: FastAPI):
     ensure_database()
     init_db()
     services.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    yield
+    interval = int(os.getenv("WHATSAPP_FLUSH_INTERVAL", "30") or 0)
+    flusher = asyncio.create_task(_whatsapp_flusher(interval)) if interval > 0 else None
+    try:
+        yield
+    finally:
+        if flusher:
+            flusher.cancel()
+
+
+def _flush_whatsapp_once() -> None:
+    with SessionLocal() as session:
+        services.flush_whatsapp_batches(session)
+
+
+async def _whatsapp_flusher(interval: int) -> None:
+    """Photos arrive one by one; once a client has been quiet for the assembly window, their photos
+    become one submission. This wakes up every `interval` seconds to do that."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await run_in_threadpool(_flush_whatsapp_once)
+        except Exception:  # noqa: BLE001 - never let the background task die
+            pass
 
 
 app = FastAPI(title="Document Request Ledger - OAK Audit", lifespan=lifespan)
@@ -100,6 +129,7 @@ PAYLOAD_LABELS = {
     "condition_basis": "Condition basis",
     "template": "Chase template",
     "pages": "Missing pages",
+    "whatsapp_message": "WhatsApp message",
     "escalation": "Escalated to",
     "carried_forward": "Carried forward",
 }
@@ -197,6 +227,8 @@ templates.env.globals.update(
     age_crit=services.AGE_CRIT_DAYS,
     firm_name=FIRM_NAME,
     smtp_configured=emailer.smtp_configured,
+    whatsapp_mode=whatsapp.mode_label,
+    whatsapp_live=whatsapp.is_live,
     can_assemble=services.can_assemble,
     link_url=emailer.client_link_url,
     profile_fields=PROFILE_FIELDS,
@@ -647,6 +679,8 @@ def chase_request(
         "emailed": result["emailed"],
         "delivered": result["chase"].delivered,
         "no_client_email": result["no_client_email"],
+        "whatsapped": result["whatsapped"],
+        "no_client_whatsapp": result["no_client_whatsapp"],
     }
 
 
@@ -854,8 +888,11 @@ def client_link_revoke(
 @app.get("/engagements/{engagement_id}/settings", response_class=HTMLResponse)
 def settings_view(http_request: HttpRequest, engagement_id: int, session: Session = Depends(get_session)):
     eng = services.get_engagement(session, engagement_id)
+    contacts = {k.lower(): v for k, v in (eng.whatsapp_contacts or {}).items()}
+    owners = [{"name": n, "phone": contacts.get(n.lower(), "")} for n in services.engagement_owner_names(session, engagement_id)]
     return templates.TemplateResponse(
-        http_request, "partials/settings.html", {"eng": eng, "smtp": emailer.smtp_configured()}
+        http_request, "partials/settings.html",
+        {"eng": eng, "smtp": emailer.smtp_configured(), "owners": owners, "wa_mode": whatsapp.mode_label()},
     )
 
 
@@ -866,11 +903,15 @@ def settings_save(
     partner_email: str = Form(""),
     age_warn_days: str = Form(""),
     age_escalate_days: str = Form(""),
+    client_whatsapp: str = Form(""),
+    owner_name: list[str] = Form([]),
+    owner_phone: list[str] = Form([]),
     session: Session = Depends(get_session),
 ):
     eng = services.update_engagement_settings(
         session, engagement_id, client_email=client_email, partner_email=partner_email,
         age_warn_days=age_warn_days, age_escalate_days=age_escalate_days,
+        client_whatsapp=client_whatsapp, whatsapp_contacts=dict(zip(owner_name, owner_phone)),
     )
     return {"ok": True, "warn": eng.age_warn_days, "escalate": eng.age_escalate_days}
 
@@ -880,16 +921,21 @@ def release_selected(
     engagement_id: int,
     request_id: list[int] = Form([]),
     actor: str = Form(""),
+    channel: str = Form("Email"),
     session: Session = Depends(get_session),
 ):
-    """Batch release: mark the ticked Drafted requests Sent together and email the client link."""
-    result = services.release_requests(session, engagement_id, request_id, actor)
+    """Batch release: mark the ticked Drafted requests Sent together and send the client link, by
+    email or on WhatsApp."""
+    result = services.release_requests(session, engagement_id, request_id, actor, channel)
+    sent = result["email"] or result["whatsapp"]
     return {
         "ok": True,
         "released": result["released"],
-        "email_id": result["email"].id,
-        "status": result["email"].status,
-        "to": result["email"].to_address,
+        "channel": result["channel"],
+        "email_id": result["email"].id if result["email"] else None,
+        "whatsapp_id": result["whatsapp"].id if result["whatsapp"] else None,
+        "status": sent.status,
+        "to": result["email"].to_address if result["email"] else result["whatsapp"].phone,
         "link": result["link"],
     }
 
@@ -898,6 +944,182 @@ def release_selected(
 def escalate(engagement_id: int, actor: str = Form(""), session: Session = Depends(get_session)):
     result = services.escalate_to_partner(session, engagement_id, actor)
     return {"ok": True, "refs": result["refs"], "email_id": result["email"].id, "status": result["email"].status}
+
+
+# --------------------------------------------------------------------------------------------
+# Pass 2: WhatsApp - webhook, simulator, inbox
+# --------------------------------------------------------------------------------------------
+def _parse_timestamp(value) -> Optional[datetime]:
+    """Provider timestamps are unix seconds (Meta) or ISO strings (generic)."""
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _handle_whatsapp_payload(payload: dict) -> list[dict]:
+    """Turn a webhook body into receive_whatsapp() calls. Two shapes are accepted: Meta's Cloud API
+    format ("entry"), and a plain JSON body (see the simulator) with
+    {from, text, reply_to, timestamp, name, id, final, media: [{filename, content_type, data_base64}]}."""
+    results = []
+    with SessionLocal() as session:
+        if "entry" in payload:
+            for m in whatsapp.parse_meta_payload(payload):
+                media = []
+                for item in m["media"]:
+                    data, mime = whatsapp.fetch_media(item["media_id"])
+                    media.append((item["filename"], item["content_type"] or mime, data))
+                out = services.receive_whatsapp(
+                    session, phone=m["phone"], text=m["text"], media=media, reply_to=m["reply_to"],
+                    provider_message_id=m["id"], received_at=_parse_timestamp(m["timestamp"]), name=m["name"],
+                )
+                results.append({"status": out["status"], "id": m["id"]})
+        else:
+            media = []
+            for item in payload.get("media") or []:
+                try:
+                    data = base64.b64decode(item.get("data_base64", ""), validate=True)
+                except ValueError as exc:
+                    raise services.LedgerError("A media item is not valid base64.") from exc
+                media.append((item.get("filename") or "file", item.get("content_type"), data))
+            out = services.receive_whatsapp(
+                session, phone=payload.get("from") or "", text=payload.get("text"), media=media,
+                reply_to=payload.get("reply_to"), provider_message_id=payload.get("id"),
+                received_at=_parse_timestamp(payload.get("timestamp")), name=payload.get("name"),
+                final=bool(payload.get("final", bool(media))),
+            )
+            results.append({"status": out["status"]})
+    return results
+
+
+@app.get("/webhooks/whatsapp/inbound")
+def whatsapp_verify(
+    mode: str = Query("", alias="hub.mode"),
+    verify_token: str = Query("", alias="hub.verify_token"),
+    challenge: str = Query("", alias="hub.challenge"),
+):
+    """Meta's one-off webhook verification handshake."""
+    expected = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+    if mode == "subscribe" and expected and verify_token == expected:
+        return PlainTextResponse(challenge)
+    return PlainTextResponse("forbidden", status_code=403)
+
+
+@app.post("/webhooks/whatsapp/inbound")
+async def whatsapp_inbound(http_request: HttpRequest):
+    """The inbound WhatsApp receiver. With a live provider every call must carry a valid signature."""
+    raw = await http_request.body()
+    if whatsapp.is_live() and not whatsapp.verify_signature(raw, http_request.headers.get("x-hub-signature-256")):
+        return JSONResponse(status_code=403, content={"error": "Invalid or missing webhook signature."})
+    try:
+        payload = json.loads(raw or b"{}")
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "The body is not valid JSON."})
+    results = await run_in_threadpool(_handle_whatsapp_payload, payload)
+    return {"ok": True, "results": results}
+
+
+@app.get("/whatsapp", response_class=HTMLResponse)
+def whatsapp_screen(http_request: HttpRequest, phone: Optional[str] = None, session: Session = Depends(get_session)):
+    """The WhatsApp screen: every conversation, the messages in it, and (in simulator mode) a panel
+    to play the client."""
+    threads = services.whatsapp_threads(session)
+    chosen = whatsapp.normalise_phone(phone) if phone else (threads[0]["phone"] if threads else None)
+    conversation = services.whatsapp_conversation(session, chosen) if chosen else []
+    ids = {m.request_id for m in conversation if m.request_id}
+    refs = {rid: ref for rid, ref in session.execute(
+        select(services.Request.id, services.Request.ref).where(services.Request.id.in_(ids)))} if ids else {}
+    return templates.TemplateResponse(
+        http_request,
+        "whatsapp.html",
+        {
+            "threads": threads,
+            "phone": chosen,
+            "conversation": conversation,
+            "refs": refs,
+            "known": services.whatsapp_known_numbers(session),
+            "open_requests": services.whatsapp_open_requests(session, chosen) if chosen else [],
+            "simulator": not whatsapp.is_live(),
+            "wa_mode": whatsapp.mode_label(),
+            "assembly_seconds": services.WHATSAPP_ASSEMBLY_SECONDS,
+        },
+    )
+
+
+@app.post("/whatsapp/simulate")
+def whatsapp_simulate(
+    phone: str = Form(...),
+    text: str = Form(""),
+    reply_to: str = Form(""),
+    action: str = Form(""),
+    separate: str = Form(""),
+    name: str = Form(""),
+    files: list[UploadFile] = File(default=[]),
+    session: Session = Depends(get_session),
+):
+    """Play the client: send a WhatsApp reply (text, photos / PDFs, or "I don't have this")."""
+    if whatsapp.is_live():
+        return JSONResponse(status_code=403, content={"error": "The simulator is off while a live WhatsApp provider is configured."})
+    media = [(f.filename or "file", f.content_type, data) for f, data in
+             ((f, f.file.read(services.MAX_UPLOAD_BYTES + 1)) for f in files[:30]) if f.filename or data]
+    if action == "unavailable":
+        text = f"{text} I don't have this".strip()
+    results = []
+    if separate and len(media) > 1:
+        # one WhatsApp message per photo, like a real phone: they are assembled later, in order
+        for i, item in enumerate(media):
+            out = services.receive_whatsapp(
+                session, phone=phone, text=text if i == 0 else None, media=[item], reply_to=reply_to or None,
+                name=name or None, final=False,
+            )
+            results.append(out["status"])
+    else:
+        out = services.receive_whatsapp(
+            session, phone=phone, text=text or None, media=media, reply_to=reply_to or None,
+            name=name or None, final=True,
+        )
+        results.append(out["status"])
+    return {"ok": True, "statuses": results}
+
+
+@app.post("/whatsapp/flush")
+def whatsapp_flush(session: Session = Depends(get_session)):
+    """Assemble every buffered WhatsApp photo run into submissions now (instead of waiting)."""
+    done = services.flush_whatsapp_batches(session, force=True)
+    return {"ok": True, "assembled": done}
+
+
+@app.post("/whatsapp/messages/{message_id}/assign")
+def whatsapp_assign(
+    message_id: int, request_id: int = Form(...), actor: str = Form(""), session: Session = Depends(get_session)
+):
+    out = services.assign_whatsapp_message(session, message_id, request_id, actor)
+    return {"ok": True, "status": out["status"]}
+
+
+@app.get("/whatsapp/media/{message_id}/{index}")
+def whatsapp_media(message_id: int, index: int, inline: int = 0, session: Session = Depends(get_session)):
+    msg = session.get(services.WhatsAppMessage, message_id)
+    if msg is None or not 0 <= index < len(msg.media or []):
+        raise services.NotFoundError("That attachment does not exist.")
+    item = msg.media[index]
+    root = services.UPLOAD_DIR.resolve()
+    path = (root / item["path"]).resolve()
+    if root not in path.parents or not path.is_file():
+        raise services.NotFoundError("The stored file is missing.")
+    if inline and item.get("content_type") in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+        # raster photos only (never SVG/HTML), sandboxed, so a thumbnail can show in the thread
+        return FileResponse(path, media_type=item["content_type"], content_disposition_type="inline",
+                            headers={"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
+    return FileResponse(path, filename=item["filename"], media_type="application/octet-stream",
+                        content_disposition_type="attachment")
 
 
 @app.get("/templates/manager", response_class=HTMLResponse)

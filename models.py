@@ -169,6 +169,11 @@ class Engagement(Base):
     # Pass 1 completion: where the client link / reminders go, who escalations go to, and the
     # ageing thresholds (days outstanding) for the amber warning and the partner escalation.
     client_email: Mapped[Optional[str]] = mapped_column(String(200))
+    # WhatsApp: the client's number, and optionally a number per named owner ({"meera shah": "+91..."}).
+    client_whatsapp: Mapped[Optional[str]] = mapped_column(String(30))
+    whatsapp_contacts: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     partner_email: Mapped[Optional[str]] = mapped_column(String(200))
     age_warn_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14, server_default=text("14"))
     age_escalate_days: Mapped[int] = mapped_column(Integer, nullable=False, default=21, server_default=text("21"))
@@ -518,6 +523,38 @@ class Chase(Base):
     opened: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     email_id: Mapped[Optional[int]] = mapped_column(ForeignKey("outbound_email.id", ondelete="RESTRICT"))
+    whatsapp_id: Mapped[Optional[int]] = mapped_column(ForeignKey("whatsapp_message.id", ondelete="RESTRICT"))
+
+
+class WhatsAppMessage(Base):
+    """Every WhatsApp message in either direction (simulated or real). The ledger events are the
+    evidence; this table is the conversation. Only the processing fields (status, request,
+    submission, note) ever change - the database refuses edits to the message itself."""
+
+    __tablename__ = "whatsapp_message"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # When it was sent / when it ARRIVED (the provider's timestamp for inbound messages).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    direction: Mapped[str] = mapped_column(String(3), nullable=False)  # 'out' | 'in'
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # request_batch / chase / auto_reply / inbound
+    phone: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    # [{"filename", "content_type", "path" (relative to the uploads dir), "sha256", "size"}]
+    media: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    # out: simulated | sent | failed.  in: buffered | submitted | duplicate | unavailable | noted |
+    # unmatched | unknown_sender | ignored | failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    engagement_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("engagement.id", ondelete="RESTRICT"), index=True
+    )
+    request_id: Mapped[Optional[int]] = mapped_column(ForeignKey("request.id", ondelete="RESTRICT"), index=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
+    reply_to_provider_id: Mapped[Optional[str]] = mapped_column(String(120))
+    submission_id: Mapped[Optional[int]] = mapped_column(ForeignKey("submission.id", ondelete="RESTRICT"))
+    sender_name: Mapped[Optional[str]] = mapped_column(String(200))
+    created_by: Mapped[Optional[str]] = mapped_column(String(200))
+    note: Mapped[Optional[str]] = mapped_column(Text)
 
 
 class ClientToken(Base):

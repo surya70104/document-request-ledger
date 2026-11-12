@@ -17,6 +17,23 @@
     <label class="block text-xs font-medium text-slate-600" for="set-partner">Partner email <span class="font-normal text-slate-400">(escalations go here)</span></label>
     <input id="set-partner" name="partner_email" type="email" value="{{ eng.partner_email or '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="partner@firm.example">
   </div>
+  <fieldset class="rounded-lg border border-emerald-200 bg-emerald-50/40 p-3">
+    <legend class="px-1 text-xs font-semibold uppercase tracking-wide text-emerald-800">WhatsApp ({{ wa_mode }})</legend>
+    <label class="block text-xs font-medium text-slate-600" for="set-wa">Client's WhatsApp number <span class="font-normal text-slate-400">(requests, chases and replies)</span></label>
+    <input id="set-wa" name="client_whatsapp" type="tel" value="{{ eng.client_whatsapp or '' }}" class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm" placeholder="+91 98765 43210">
+    {% if owners %}
+    <p class="mt-3 text-xs font-medium text-slate-600">A number per named owner <span class="font-normal text-slate-400">(optional - their chases go to them, and they can only answer for their own requests)</span></p>
+    <div class="mt-1 space-y-2">
+      {% for o in owners %}
+      <div class="grid grid-cols-[1fr_1.2fr] items-center gap-2">
+        <input type="hidden" name="owner_name" value="{{ o.name }}">
+        <span class="text-sm text-slate-700">{{ o.name }}</span>
+        <input name="owner_phone" type="tel" value="{{ o.phone }}" class="rounded-md border border-slate-300 px-2.5 py-1.5 text-sm" placeholder="+91 ...">
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </fieldset>
   <fieldset class="rounded-lg border border-slate-200 p-3">
     <legend class="px-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Ageing thresholds (days outstanding)</legend>
     <div class="grid grid-cols-2 gap-3">

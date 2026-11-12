@@ -101,6 +101,10 @@
   {# ---- Batch release bar (appears when Drafted requests are ticked) ---- #}
   <div id="release-bar" class="mt-3 hidden items-center justify-between gap-3 rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-950 [&:not(.hidden)]:flex">
     <span id="release-count" class="font-medium"></span>
+    <label class="ml-auto flex items-center gap-2 text-xs font-medium text-emerald-900">Send by
+      <select id="release-channel" class="rounded-md border border-emerald-300 bg-white px-2 py-1.5 text-sm">
+        <option value="Email">Email</option><option value="WhatsApp">WhatsApp</option>
+      </select></label>
     <button type="button" id="release-selected" data-engagement="{{ selected.id }}" class="rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800">Release selected (Send)</button>
   </div>
 
@@ -815,7 +819,9 @@
     });
     showToast(`Chase recorded on <b>${esc(ref)}</b> - now chased ${data.chase_count} time${data.chase_count === 1 ? '' : 's'}.` +
       (data.emailed ? ' Emailed to the client with the upload link (see the <a class="underline" href="/outbox">Outbox</a>).' : '') +
-      (data.no_client_email ? ' No client email is set, so nothing was emailed.' : ''));
+      (data.no_client_email ? ' No client email is set, so nothing was emailed.' : '') +
+      (data.whatsapped ? ' Sent on WhatsApp (see the <a class="underline" href="/whatsapp">WhatsApp screen</a>).' : '') +
+      (data.no_client_whatsapp ? ' No WhatsApp number is set, so nothing was sent.' : ''));
     if (currentId !== null && String(currentId) === String(id)) loadDrawer(id);
     if (boardPanel && !boardPanel.classList.contains('hidden')) setTimeout(() => loadBoard(), 900);
   });
@@ -853,13 +859,14 @@
     if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
     const ids = [...document.querySelectorAll('.rel-check:checked')].map((c) => c.value);
     if (!ids.length) return;
-    if (!confirm(`Release ${ids.length} request${ids.length === 1 ? '' : 's'} to the client?\n\nEach is marked SENT (by email) and ONE email with the upload link and the list is sent to the client. This is recorded in the history of every request.`)) return;
+    const channel = document.getElementById('release-channel').value;
+    if (!confirm(`Release ${ids.length} request${ids.length === 1 ? '' : 's'} to the client?\n\nEach is marked SENT (on ${channel}) and ONE ${channel === 'WhatsApp' ? 'WhatsApp message' : 'email'} with the upload link and the list is sent to the client. This is recorded in the history of every request.`)) return;
     relBtn.disabled = true;
-    const fd = new FormData(); fd.set('actor', actor); ids.forEach((i) => fd.append('request_id', i));
+    const fd = new FormData(); fd.set('actor', actor); fd.set('channel', channel); ids.forEach((i) => fd.append('request_id', i));
     const { ok, data } = await postForm(`/engagements/${relBtn.dataset.engagement}/release`, fd);
     relBtn.disabled = false;
     if (!ok) { alert(data.error || 'Could not release the requests.'); return; }
-    showToast(`Released <b>${data.released.length}</b> request${data.released.length === 1 ? '' : 's'}. Email to ${esc(data.to)} (${data.status === 'sent' ? 'sent via SMTP' : 'in the local Outbox'}) - <a class="underline" href="/outbox?eng=${relBtn.dataset.engagement}">view it</a>.`);
+    showToast(`Released <b>${data.released.length}</b> request${data.released.length === 1 ? '' : 's'}. ${data.channel === 'WhatsApp' ? `WhatsApp to ${esc(data.to)} (${data.status === 'sent' ? 'sent' : 'in the WhatsApp simulator'}) - <a class="underline" href="/whatsapp?phone=${encodeURIComponent(data.to)}">view it</a>.` : `Email to ${esc(data.to)} (${data.status === 'sent' ? 'sent via SMTP' : 'in the local Outbox'}) - <a class="underline" href="/outbox?eng=${relBtn.dataset.engagement}">view it</a>.`}`);
     setTimeout(() => location.reload(), 1800);
   });
 

@@ -34,6 +34,7 @@
     .pill.mat { background: #be123c; color: #fff; border-color: #be123c; }
     .pill.bad { background: #fee2e2; color: var(--bad); border-color: #fecaca; }
     .pill.good { background: #d1fae5; color: var(--good); border-color: #a7f3d0; }
+    .pill.wa { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
     .pill.warn { background: #fef3c7; color: var(--warn); border-color: #fde68a; }
     table.tl th, table.sub th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); border-bottom: 1px solid var(--ink); padding: 6px 8px; }
     table.tl td, table.sub td { padding: 7px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
@@ -119,7 +120,7 @@
           <td class="when">{{ ev.at|ist('%d %b %Y, %H:%M') }}</td>
           <td class="ev">{{ ev.label }}{% if ev.event_type == 'REJECTED' %}<div class="detail" style="color:var(--bad)"><b>{{ (ev.payload or {}).get('reason_label', '') }}</b></div>{% endif %}</td>
           <td>
-            {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
+            {{ ev.actor }}{% if ev.channel == 'WhatsApp' %} · <span class="pill wa">WhatsApp</span>{% elif ev.channel %} · via {{ ev.channel }}{% endif %}
             {% set items = payload_items(ev) %}
             {% if items %}<div class="detail">{% for label, value in items %}<b>{{ label }}:</b> {{ value }}{{ ' · ' if not loop.last else '' }}{% endfor %}</div>{% endif %}
             {% set ch = chases.get(ev.id) if chases else None %}
@@ -137,7 +138,7 @@
     {% for sub in r.submissions %}
     <div class="sub-card">
       <header>
-        <div><b>Attempt {{ sub.attempt_number }}</b> · received {{ sub.received_at|ist }} via {{ sub.channel }}{% if sub.submitted_by %} from {{ sub.submitted_by }}{% endif %}</div>
+        <div><b>Attempt {{ sub.attempt_number }}</b> · received {{ sub.received_at|ist }} via {% if sub.channel == 'WhatsApp' %}<span class="pill wa">WhatsApp</span>{% else %}{{ sub.channel }}{% endif %}{% if sub.submitted_by %} from {{ sub.submitted_by }}{% endif %}</div>
         <div>
           {% if sub.outcome == 'accepted' %}<span class="pill good">Accepted</span>
           {% elif sub.outcome == 'rejected' %}{% set rc = reason_codes.get(sub.reason_code) %}<span class="pill bad">Rejected - {{ rc[0] if rc else sub.reason_code }}</span>

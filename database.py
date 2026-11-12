@@ -158,6 +158,29 @@ _GUARD_DDL = [
         BEFORE UPDATE OR DELETE ON engagement
         FOR EACH ROW EXECUTE FUNCTION ledger_block_closed_engagement();
     """,
+    # WhatsApp messages are never deleted and the message itself never edited; only the
+    # processing fields (status, request, submission, note) change.
+    """
+    CREATE OR REPLACE FUNCTION ledger_whatsapp_guard() RETURNS trigger AS $$
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'whatsapp messages cannot be deleted' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.created_at IS DISTINCT FROM OLD.created_at OR NEW.direction IS DISTINCT FROM OLD.direction
+           OR NEW.phone IS DISTINCT FROM OLD.phone OR NEW.body IS DISTINCT FROM OLD.body
+           OR NEW.media IS DISTINCT FROM OLD.media OR NEW.provider_message_id IS DISTINCT FROM OLD.provider_message_id THEN
+            RAISE EXCEPTION 'a whatsapp message cannot be edited' USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    "DROP TRIGGER IF EXISTS trg_whatsapp_guard ON whatsapp_message;",
+    """
+    CREATE TRIGGER trg_whatsapp_guard
+        BEFORE UPDATE OR DELETE ON whatsapp_message
+        FOR EACH ROW EXECUTE FUNCTION ledger_whatsapp_guard();
+    """,
     # Pass 1 completion: a chase row is never deleted and only its delivered / opened flags may
     # change (false -> true).
     """
@@ -217,6 +240,10 @@ _MIGRATIONS = [
     "ALTER TABLE client_token ADD COLUMN IF NOT EXISTS owner_person VARCHAR(200)",
     # Pass 1 completion: engagement settings (the chase / outbound_email / client_token tables are
     # created by create_all).
+    # Pass 2 / WhatsApp
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS client_whatsapp VARCHAR(30)",
+    "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS whatsapp_contacts JSONB NOT NULL DEFAULT CAST('{}' AS jsonb)",
+    "ALTER TABLE chase ADD COLUMN IF NOT EXISTS whatsapp_id INTEGER REFERENCES whatsapp_message(id) ON DELETE RESTRICT",
     "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS published_by VARCHAR(200)",
     "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS change_note TEXT",
     "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS client_email VARCHAR(200)",

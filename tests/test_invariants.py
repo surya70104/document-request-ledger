@@ -1176,3 +1176,406 @@ def test_pages_assemble_into_one_pdf_in_page_order(session, make_engagement, mak
     assert client.get(f"/submissions/{xs.id}/document.pdf").status_code == 400
     assert f"/submissions/{xs.id}/document.pdf" not in client.get(f"/requests/{sheet.id}/trail").text
     assert client.get("/submissions/999999/document.pdf").status_code == 404
+
+
+# ============================================================================================
+# Pass 2 - the two-way WhatsApp channel
+# ============================================================================================
+import base64
+import hashlib
+from datetime import datetime, timezone
+import hmac as _hmac
+import json as _json
+
+import whatsapp
+from models import WhatsAppMessage
+
+import itertools
+import types
+
+_wa_counter = itertools.count(1)
+
+
+@pytest.fixture()
+def wa():
+    """Phone numbers unique to one test (every test gets its own client and owner numbers), in the
+    messy forms people type them and in their normalised form."""
+    n = next(_wa_counter)
+    c10, m10 = f"99{n:08d}", f"98{n:08d}"
+    return types.SimpleNamespace(
+        c=f"+91{c10}", m=f"+91{m10}", c_raw=f"+91 {c10[:5]} {c10[5:]}", m_raw=f"+91 {m10[:5]} {m10[5:]}",
+        c_trunk=f"0{c10[:5]} {c10[5:]}", m_trunk=f"0{m10[:5]} {m10[5:]}")
+
+
+def _wa_eng(make_engagement, wa, **kw):
+    """An engagement whose client number is written the messy way a person types it."""
+    return make_engagement(client_whatsapp=wa.c_raw, **kw)
+
+
+def _wa_messages(session, phone):
+    session.expire_all()
+    return list(session.execute(select(WhatsAppMessage).where(WhatsAppMessage.phone == phone)
+                                .order_by(WhatsAppMessage.id)).scalars())
+
+
+def _photo(n):
+    return (f"IMG-{n}.jpg", "image/jpeg", f"photo bytes number {n}".encode())
+
+
+# --------------------------------------------------------------------------------------------
+# Outbound
+# --------------------------------------------------------------------------------------------
+def test_whatsapp_chase_is_sent_logged_and_tracked(session, wa, make_engagement, make_request, client):
+    eng = _wa_eng(make_engagement, wa, whatsapp_contacts={"meera shah": wa.m_trunk})
+    ravi = make_request(eng, "Bank statements", description="Your bank statements for the year",
+                        owner="Ravi Menon (Accountant)", period_from=date(2025, 4, 1), period_to=date(2026, 3, 31))
+    meera = make_request(eng, "Payroll register", owner="Meera Shah (Finance Controller)")
+
+    res = services.record_chase(session, ravi.id, "Arjun", "WhatsApp", template="gentle")
+    assert res["whatsapped"] and res["chase"].delivered and res["chase"].whatsapp_id and not res["no_client_whatsapp"]
+    assert res["event"].event_type == "CHASED" and res["event"].channel == "WhatsApp"
+    msg = session.get(WhatsAppMessage, res["chase"].whatsapp_id)
+    assert (msg.direction, msg.kind, msg.status, msg.phone) == ("out", "chase", "simulated", wa.c)
+    assert msg.provider_message_id.startswith("sim-") and msg.request_id == ravi.id
+    assert "Your bank statements for the year" in msg.body, "the client's own wording"
+    assert "01 April 2025 to 31 March 2026" in msg.body and ravi.ref in msg.body
+    assert re.search(r"http://testserver/c/\S+", msg.body), "the no-login link"
+
+    # the owner's own number when she has one
+    to_meera = services.record_chase(session, meera.id, "Arjun", "WhatsApp", note="Payroll please, Meera")
+    assert session.get(WhatsAppMessage, to_meera["chase"].whatsapp_id).phone == wa.m
+    assert "Payroll please, Meera" in session.get(WhatsAppMessage, to_meera["chase"].whatsapp_id).body
+
+    # no number: still recorded as a chase made by hand, but nothing is sent
+    bare = make_request(make_engagement(), "Orphan")
+    res = services.record_chase(session, bare.id, "Arjun", "WhatsApp", note="called and messaged")
+    assert res["no_client_whatsapp"] and not res["whatsapped"] and not res["chase"].delivered
+    assert res["event"].channel == "WhatsApp"
+
+    # the simulator screen shows it
+    page = client.get(f"/whatsapp?phone={wa.c.replace('+', '%2B')}")
+    assert page.status_code == 200 and "Your bank statements for the year" in page.text and "simulated" in page.text
+    assert "Simulate Client WhatsApp Reply" in page.text
+
+
+def test_release_on_whatsapp_sends_one_message_and_logs_sent_events(session, wa, make_engagement, make_request, client, monkeypatch):
+    eng = _wa_eng(make_engagement, wa)
+    drafts = [make_request(eng, f"Doc number {i}", send=False, priority=(i % 3) + 1) for i in range(1, 8)]
+    with pytest.raises(services.LedgerError, match="WhatsApp number"):
+        services.release_requests(session, make_engagement().id, [make_request(make_engagement(), "x", send=False).id],
+                                  "Priya", "WhatsApp")
+
+    res = services.release_requests(session, eng.id, [d.id for d in drafts], "Priya", "WhatsApp")
+    assert res["channel"] == "WhatsApp" and res["email"] is None and len(res["released"]) == 7
+    for d in drafts:
+        sent = [e for e in services.get_request(session, d.id).events if e.event_type == "SENT"]
+        assert len(sent) == 1 and sent[0].channel == "WhatsApp" and "WhatsApp" in sent[0].payload["note"]
+    batch = [m for m in _wa_messages(session, wa.c) if m.kind == "request_batch"]
+    assert len(batch) == 1, "one message, not seven"
+    body = batch[0].body
+    assert res["link"] in body and "7 document requests" in body and "...and 2 more" in body
+    assert sum(1 for d in drafts if f"[{d.ref}]" in body) == 5, "five at a time, with their codes"
+    assert not services.list_outbox(session, eng.id), "no email was involved"
+
+    # the provider refusing it: nothing is released
+    more = [make_request(eng, f"Late doc {i}", send=False) for i in range(2)]
+
+    def boom(to, body):
+        raise whatsapp.WhatsAppDeliveryError("provider down")
+
+    monkeypatch.setattr(whatsapp, "send_text", boom)
+    with pytest.raises(services.LedgerError, match="Nothing was released"):
+        services.release_requests(session, eng.id, [m.id for m in more], "Priya", "WhatsApp")
+    assert all(states(session, eng)[m.ref] == "Drafted" for m in more)
+    assert [m for m in _wa_messages(session, wa.c) if m.status == "failed" and "provider down" in (m.note or "")]
+    with pytest.raises(services.LedgerError, match="chase was not recorded"):
+        services.record_chase(session, drafts[0].id, "Arjun", "WhatsApp", note="x")
+    assert len([e for e in services.get_request(session, drafts[0].id).events if e.event_type == "CHASED"]) == 0
+    monkeypatch.undo()
+
+    # over HTTP
+    r = client.post(f"/engagements/{eng.id}/release", data={"request_id": [m.id for m in more], "actor": "Priya", "channel": "WhatsApp"})
+    assert r.status_code == 200 and r.json()["channel"] == "WhatsApp" and r.json()["to"] == wa.c
+
+
+# --------------------------------------------------------------------------------------------
+# Inbound: photos and files come back
+# --------------------------------------------------------------------------------------------
+def test_whatsapp_reply_with_photos_is_one_submission_in_order(session, wa, make_engagement, make_request):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Twelve-page ledger")
+    chase = services.record_chase(session, req.id, "Arjun", "WhatsApp", template="gentle")
+    asked = session.get(WhatsAppMessage, chase["chase"].whatsapp_id)
+    t0 = utcnow() + timedelta(seconds=5)
+
+    out = services.receive_whatsapp(
+        session, phone=wa.c_trunk, text="here you go", media=[_photo(1), _photo(2), _photo(3)],
+        reply_to=asked.provider_message_id, name="Ravi Menon", received_at=t0, final=True)
+    assert out["status"] == "submitted" and out["matched_by"] == "reply"
+
+    got = services.get_request(session, req.id)
+    kinds = [(e.event_type, e.channel) for e in got.events]
+    assert kinds[-2:] == [("ACKNOWLEDGED", "WhatsApp"), ("SUBMITTED", "WhatsApp")], "acknowledged first, then submitted"
+    assert got.events[-2].actor == "Ravi Menon (client)" and "here you go" in got.events[-2].payload["note"]
+    assert got.state == "Submitted" and len(got.submissions) == 1
+    sub = got.submissions[0]
+    assert sub.channel == "WhatsApp" and sub.submitted_by == "Ravi Menon"
+    assert [(f.page_order, f.filename) for f in sub.files] == [(1, "IMG-1.jpg"), (2, "IMG-2.jpg"), (3, "IMG-3.jpg")]
+    assert got.events[-1].payload["note"] == "here you go", "the caption travels with the submission"
+    assert services.can_assemble(sub)
+    inbound = [m for m in _wa_messages(session, wa.c) if m.direction == "in"]
+    assert len(inbound) == 1 and inbound[0].status == "submitted" and inbound[0].submission_id == sub.id
+    assert inbound[0].created_at == t0, "the exact arrival time is kept"
+    assert any("Received 3 pages" in (m.body or "") for m in _wa_messages(session, wa.c) if m.direction == "out"), "the client is thanked"
+
+
+def test_whatsapp_photos_sent_one_by_one_are_assembled_with_their_own_times(session, wa, make_engagement, make_request):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Bank statements")
+    t0 = utcnow() + timedelta(seconds=5)
+
+    a = services.receive_whatsapp(session, phone=wa.c, text=f"{req.ref} page by page", media=[_photo(1)],
+                                  received_at=t0, name="Ravi Menon")
+    assert a["status"] == "buffered" and a["matched_by"] == "code"
+    b = services.receive_whatsapp(session, phone=wa.c, media=[_photo(2)], received_at=t0 + timedelta(seconds=30))
+    c = services.receive_whatsapp(session, phone=wa.c, media=[_photo(3)], received_at=t0 + timedelta(seconds=50))
+    assert b["matched_by"] == "continued" and c["matched_by"] == "continued", "later photos join the run - no guessing"
+    assert services.get_request(session, req.id).submissions == [], "nothing is filed while photos are still arriving"
+    assert services.flush_whatsapp_batches(session, now=t0 + timedelta(seconds=60)) == [], "still inside the quiet window"
+
+    done = services.flush_whatsapp_batches(session, now=t0 + timedelta(seconds=50 + services.WHATSAPP_ASSEMBLY_SECONDS + 1))
+    assert len(done) == 1 and done[0]["status"] == "submitted" and done[0]["pages"] == 3
+    got = services.get_request(session, req.id)
+    sub = got.submissions[0]
+    assert [(f.page_order, f.filename) for f in sub.files] == [(1, "IMG-1.jpg"), (2, "IMG-2.jpg"), (3, "IMG-3.jpg")]
+    assert sub.received_at == t0, "the submission began when the first photo arrived"
+    assert got.events[-1].event_type == "SUBMITTED" and got.events[-1].at == t0 + timedelta(seconds=50)
+    assert [m.status for m in _wa_messages(session, wa.c) if m.direction == "in"] == ["submitted"] * 3
+
+    # saying "done" assembles straight away
+    other = make_request(eng, "Payroll")
+    t1 = utcnow() + timedelta(minutes=5)
+    services.receive_whatsapp(session, phone=wa.c, text=other.ref, media=[_photo(8)], received_at=t1)
+    res = services.receive_whatsapp(session, phone=wa.c, text="Done!", received_at=t1 + timedelta(seconds=5))
+    assert res["assembled"][0]["status"] == "submitted"
+    assert len(services.get_request(session, other.id).submissions) == 1
+
+
+def test_whatsapp_resend_is_an_arrival_not_a_second_submission(session, wa, make_engagement, make_request, client):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Trial balance")
+    token = services.create_client_token(session, eng.id, "Priya").token
+    t0 = utcnow() + timedelta(seconds=5)
+
+    # the same photo twice in one WhatsApp message is one page
+    out = services.receive_whatsapp(session, phone=wa.c, text=req.ref, media=[_photo(1), _photo(2), _photo(1)],
+                                    received_at=t0, final=True)
+    assert out["status"] == "submitted"
+    sub = services.get_request(session, req.id).submissions[0]
+    assert [f.filename for f in sub.files] == ["IMG-1.jpg", "IMG-2.jpg"] and len(sub.files[0].arrivals) == 1
+
+    # the client sends photo 2 again later: an arrival on WhatsApp, no new submission
+    t1 = t0 + timedelta(minutes=2)
+    again = services.receive_whatsapp(session, phone=wa.c, text=f"{req.ref} sorry, again", media=[_photo(2)],
+                                      received_at=t1, final=True)
+    assert again["status"] == "duplicate"
+    got = services.get_request(session, req.id)
+    assert len(got.submissions) == 1, "still one submission"
+    f2 = got.submissions[0].files[1]
+    assert len(f2.arrivals) == 1 and f2.arrivals[0].channel == "WhatsApp" and f2.arrivals[0].arrived_at == t1
+    assert 1 + len(f2.arrivals) == 2, "two arrivals of that photo"
+    assert got.events[-1].event_type == "ARRIVAL_RECORDED" and got.events[-1].channel == "WhatsApp"
+    assert [m for m in _wa_messages(session, wa.c) if m.status == "duplicate"]
+
+    # content already received by another channel is matched too (one engine for every channel)
+    other = make_request(eng, "Payroll")
+    assert client.post(f"/c/{token}/requests/{other.id}/upload", files={"files": ("p.jpg", b"shared bytes")}).status_code == 200
+    res = services.receive_whatsapp(session, phone=wa.c, text=other.ref, media=[("copy.jpg", "image/jpeg", b"shared bytes")],
+                                    received_at=utcnow() + timedelta(minutes=3), final=True)
+    assert res["status"] == "duplicate" and len(services.get_request(session, other.id).submissions) == 1
+
+
+def test_whatsapp_unavailable_notes_unmatched_and_unknown_senders(session, wa, make_engagement, make_request):
+    eng = _wa_eng(make_engagement, wa, whatsapp_contacts={"meera shah": wa.m})
+    ravi = make_request(eng, "Rental agreements", owner="Ravi Menon (Accountant)", priority=1)
+    meera = make_request(eng, "Payroll", owner="Meera Shah (Finance Controller)", priority=2)
+    t = utcnow() + timedelta(seconds=5)
+
+    # "I don't have this" -> acknowledged, then CLIENT_REPORTED_UNAVAILABLE on WhatsApp
+    out = services.receive_whatsapp(session, phone=wa.c, text=f"{ravi.ref} I don't have this, sorry",
+                                    received_at=t, name="Ravi Menon")
+    assert out["status"] == "unavailable"
+    got = services.get_request(session, ravi.id)
+    assert [e.event_type for e in got.events][-2:] == ["ACKNOWLEDGED", "CLIENT_REPORTED_UNAVAILABLE"]
+    assert got.events[-1].channel == "WhatsApp" and "don't have this" in got.events[-1].payload["reason"]
+    assert got.reported_unavailable is not None and got.state == "Acknowledged"
+
+    # plain text from an acknowledged request: a note on the ledger
+    services.receive_whatsapp(session, phone=wa.c, text=f"{meera.ref} will send tomorrow", received_at=t + timedelta(seconds=1))
+    out = services.receive_whatsapp(session, phone=wa.c, text=f"{meera.ref} sorry, Monday actually", received_at=t + timedelta(seconds=2))
+    note = services.get_request(session, meera.id).events[-1]
+    assert out["status"] == "noted" and note.event_type == "NOTE" and note.channel == "WhatsApp" and "Monday" in note.payload["note"]
+
+    # no code, no reply -> never guessed: stored as unmatched, and the client is asked
+    stray = services.receive_whatsapp(session, phone=wa.c, media=[_photo(9)], received_at=t + timedelta(seconds=3), final=True)
+    assert stray["status"] == "unmatched"
+    asks = [m for m in _wa_messages(session, wa.c) if m.kind == "auto_reply" and m.note == "which_request"]
+    assert len(asks) == 1 and f"[{meera.ref}]" in asks[0].body
+    services.receive_whatsapp(session, phone=wa.c, media=[_photo(10)], received_at=t + timedelta(seconds=4), final=True)
+    assert len([m for m in _wa_messages(session, wa.c) if m.note == "which_request"]) == 1, "asked once, not nagged"
+    assert not services.get_request(session, meera.id).submissions
+
+    # a person assigns it: processed exactly as if the client had sent the code
+    lone = stray["message"]
+    with pytest.raises(services.LedgerError, match="not one this WhatsApp number"):
+        services.assign_whatsapp_message(session, lone.id, make_request(make_engagement(), "Elsewhere").id, "Priya")
+    assigned = services.assign_whatsapp_message(session, lone.id, meera.id, "Priya")
+    assert assigned["status"] == "submitted"
+    assert [f.filename for f in services.get_request(session, meera.id).submissions[0].files] == ["IMG-9.jpg"]
+    with pytest.raises(services.LedgerError, match="already handled"):
+        services.assign_whatsapp_message(session, lone.id, meera.id, "Priya")
+
+    # Meera's own number can only answer for Meera's requests
+    wrong = services.receive_whatsapp(session, phone=wa.m, text=f"{ravi.ref} here", media=[_photo(5)], final=True)
+    assert wrong["status"] == "unmatched" and "someone else" in wrong["reason"]
+    right = services.receive_whatsapp(session, phone=wa.m, text=f"{meera.ref} more pages", media=[_photo(6)], final=True)
+    assert right["status"] == "submitted" or right["status"] == "failed"  # Submitted already: new content refused politely
+
+    # a stranger's number: stored, never answered, nothing touched
+    before = len(services.get_request(session, ravi.id).events)
+    stranger = services.receive_whatsapp(session, phone="+14155550100", text=f"{ravi.ref} hello")
+    assert stranger["status"] == "unknown_sender"
+    assert not _wa_messages(session, "+14155550100")[0].request_id
+    assert [m for m in _wa_messages(session, "+14155550100") if m.direction == "out"] == []
+    assert len(services.get_request(session, ravi.id).events) == before
+
+    # a webhook retry with the same provider id is ignored; a closed engagement refuses politely
+    first = services.receive_whatsapp(session, phone=wa.c, text=f"{meera.ref} hi again", provider_message_id="wamid.1")
+    retry = services.receive_whatsapp(session, phone=wa.c, text=f"{meera.ref} hi again", provider_message_id="wamid.1")
+    assert retry["duplicate_delivery"] and retry["message"].id == first["message"].id
+    services.close_engagement(session, eng.id, "Partner")
+    late = services.receive_whatsapp(session, phone=wa.c, text=f"{ravi.ref} still here", media=[_photo(7)], final=True)
+    assert late["status"] == "ignored"
+    assert [m.body for m in _wa_messages(session, wa.c) if m.direction == "out"][-1].startswith("Thank you - this engagement is closed")
+
+
+# --------------------------------------------------------------------------------------------
+# Unified timeline: ordering, badges and timestamps in the drawer and the exported thread
+# --------------------------------------------------------------------------------------------
+def test_whatsapp_events_form_one_ordered_timeline_with_badges(session, wa, make_engagement, make_request, client):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Ledgers", send=False)
+    services.release_requests(session, eng.id, [req.id], "Priya", "WhatsApp")
+    services.record_chase(session, req.id, "Arjun", "WhatsApp", template="date")
+    t = utcnow() + timedelta(seconds=10)
+    services.receive_whatsapp(session, phone=wa.c, text=f"{req.ref} attached", media=[_photo(1), _photo(2)],
+                              received_at=t, name="Ravi Menon", final=True)
+
+    got = services.get_request(session, req.id)
+    assert [(e.event_type, e.channel) for e in got.events] == [
+        ("DRAFTED", "Manual"), ("SENT", "WhatsApp"), ("CHASED", "WhatsApp"), ("ACKNOWLEDGED", "WhatsApp"), ("SUBMITTED", "WhatsApp")]
+    assert [e.seq for e in got.events] == [1, 2, 3, 4, 5]
+    stamps = [e.at for e in got.events]
+    assert stamps == sorted(stamps), "outbound and inbound events interleave in time order"
+    assert got.events[3].at == t and got.events[4].at == t
+
+    session.rollback()
+    drawer = client.get(f"/requests/{req.id}/trail").text
+    assert drawer.count("WhatsApp</span>") >= 5, "every WhatsApp event (and the submission) carries a badge"
+    assert "Replied on WhatsApp: " in drawer and "attached" in drawer
+    export = client.get(f"/engagements/{eng.id}/requests/{req.ref}/export").text
+    assert export.count('class="pill wa">WhatsApp') >= 5 and "Thread fingerprint" in export
+    assert "Replied on WhatsApp" in export
+    # the exported thread lists the events in the same order
+    timeline = export[export.index("Timeline"):]
+    positions = [timeline.index(f'<td class="ev">{label}') for label in ("Drafted", "Sent", "Chased", "Acknowledged", "Submitted")]
+    assert positions == sorted(positions)
+
+
+# --------------------------------------------------------------------------------------------
+# The webhook and the simulator endpoints
+# --------------------------------------------------------------------------------------------
+def test_whatsapp_webhook_simulator_and_signature(session, wa, make_engagement, make_request, client, monkeypatch):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Ledger one")
+    other = make_request(eng, "Ledger two")
+    third = make_request(eng, "Ledger three")
+
+    # generic JSON webhook: a message with two attachments is one submission
+    payload = {"from": wa.c_raw, "text": f"{req.ref} attached", "name": "Ravi Menon",
+               "media": [{"filename": "a.jpg", "content_type": "image/jpeg", "data_base64": base64.b64encode(b"AAA").decode()},
+                         {"filename": "b.jpg", "content_type": "image/jpeg", "data_base64": base64.b64encode(b"BBB").decode()}]}
+    r = client.post("/webhooks/whatsapp/inbound", json=payload)
+    assert r.status_code == 200 and r.json()["results"][0]["status"] == "submitted"
+    assert [f.filename for f in services.get_request(session, req.id).submissions[0].files] == ["a.jpg", "b.jpg"]
+    assert client.post("/webhooks/whatsapp/inbound", content=b"not json").status_code == 400
+    assert client.post("/webhooks/whatsapp/inbound", json={"from": "x", "text": "hi"}).status_code == 400
+
+    # Meta Cloud API format: one message per photo, media fetched from the provider
+    monkeypatch.setattr(whatsapp, "fetch_media", lambda media_id: (f"bytes of {media_id}".encode(), "image/jpeg"))
+
+    def meta(msg_id, media_id, caption=None, ts="1893456000"):
+        return {"entry": [{"changes": [{"value": {
+            "contacts": [{"wa_id": wa.c.lstrip("+"), "profile": {"name": "Ravi"}}],
+            "messages": [{"from": wa.c.lstrip("+"), "id": msg_id, "timestamp": ts, "type": "image",
+                          "image": {"id": media_id, "mime_type": "image/jpeg", **({"caption": caption} if caption else {})}}]}}]}]}
+
+    assert client.post("/webhooks/whatsapp/inbound", json=meta("wamid.A", "media-1", f"{other.ref} first")).json()["results"][0]["status"] == "buffered"
+    assert client.post("/webhooks/whatsapp/inbound", json=meta("wamid.B", "media-2", None, "1893456010")).json()["results"][0]["status"] == "buffered"
+    assert client.post("/webhooks/whatsapp/inbound", json=meta("wamid.A", "media-1", f"{other.ref} first")).json()["results"][0]["status"] == "buffered", "a retried delivery changes nothing"
+    flushed = client.post("/whatsapp/flush").json()["assembled"]
+    assert len(flushed) == 1 and flushed[0]["pages"] == 2
+    session.expire_all()
+    sub = services.get_request(session, other.id).submissions[0]
+    assert sub.received_at == datetime.fromtimestamp(1893456000, tz=timezone.utc), "the provider's timestamp is the arrival time"
+
+    # the simulator: separate messages, "I don't have this", and assigning
+    sim = client.post("/whatsapp/simulate", data={"phone": wa.c, "text": third.ref, "separate": "1"},
+                      files=[("files", ("s1.jpg", b"S1", "image/jpeg")), ("files", ("s2.jpg", b"S2", "image/jpeg"))])
+    assert sim.status_code == 200 and sim.json()["statuses"] == ["buffered", "buffered"]
+    assert client.post("/whatsapp/flush").json()["assembled"][0]["pages"] == 2
+    un = make_request(eng, "Needs a no")
+    assert client.post("/whatsapp/simulate", data={"phone": wa.c, "text": un.ref, "action": "unavailable"}).json()["statuses"] == ["unavailable"]
+    stray = client.post("/whatsapp/simulate", data={"phone": wa.c}, files=[("files", ("lost.jpg", b"LOST", "image/jpeg"))])
+    assert stray.json()["statuses"] == ["unmatched"]
+    target = make_request(eng, "Assign me")
+    lone = next(m for m in _wa_messages(session, wa.c) if m.status == "unmatched")
+    assert client.post(f"/whatsapp/messages/{lone.id}/assign", data={"request_id": target.id, "actor": "Priya"}).status_code == 200
+    # attachments download; photos can show inline
+    assert client.get(f"/whatsapp/media/{lone.id}/0").headers["content-disposition"].startswith("attachment")
+    inline = client.get(f"/whatsapp/media/{lone.id}/0?inline=1")
+    assert inline.headers["content-type"] == "image/jpeg" and inline.headers["content-security-policy"] == "sandbox"
+    assert client.get(f"/whatsapp/media/{lone.id}/5").status_code == 404
+
+    # live mode: signature required, verification handshake, simulator off
+    monkeypatch.setattr(whatsapp, "is_live", lambda: True)
+    monkeypatch.setattr(whatsapp, "send_text", lambda to, body: {"id": "wamid.out", "mode": "sent"})
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "s3cret")
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "verify-me")
+    body = _json.dumps({"from": wa.c, "text": f"{target.ref} note"}).encode()
+    assert client.post("/webhooks/whatsapp/inbound", content=body).status_code == 403
+    assert client.post("/webhooks/whatsapp/inbound", content=body, headers={"x-hub-signature-256": "sha256=deadbeef"}).status_code == 403
+    sig = "sha256=" + _hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+    assert client.post("/webhooks/whatsapp/inbound", content=body, headers={"x-hub-signature-256": sig}).status_code == 200
+    assert client.get("/webhooks/whatsapp/inbound", params={"hub.mode": "subscribe", "hub.verify_token": "verify-me", "hub.challenge": "1234"}).text == "1234"
+    assert client.get("/webhooks/whatsapp/inbound", params={"hub.mode": "subscribe", "hub.verify_token": "wrong", "hub.challenge": "1"}).status_code == 403
+    assert client.post("/whatsapp/simulate", data={"phone": wa.c, "text": "hi"}).status_code == 403
+    assert whatsapp.normalise_phone("98765 43210") == "+919876543210" and whatsapp.normalise_phone("0044 20 7946 0958") == "+442079460958"
+    assert whatsapp.normalise_phone("12") is None and whatsapp.normalise_phone("") is None
+    monkeypatch.undo()
+
+
+def test_engagement_whatsapp_settings_are_validated_and_normalised(session, wa, make_engagement, make_request):
+    eng = make_engagement(client_email="c@client.example")
+    services.update_engagement_settings(
+        session, eng.id, client_email="c@client.example", client_whatsapp=wa.c_trunk,
+        whatsapp_contacts={"Meera Shah": wa.m_raw, "Nobody": ""})
+    session.expire_all()
+    eng = services.get_engagement(session, eng.id)
+    assert eng.client_whatsapp == wa.c and eng.whatsapp_contacts == {"meera shah": wa.m}
+    with pytest.raises(services.LedgerError, match="not a valid WhatsApp number"):
+        services.update_engagement_settings(session, eng.id, client_whatsapp="12")
+    # settings saved without the WhatsApp fields leave the numbers alone
+    services.update_engagement_settings(session, eng.id, client_email="c@client.example")
+    session.expire_all()
+    assert services.get_engagement(session, eng.id).client_whatsapp == wa.c

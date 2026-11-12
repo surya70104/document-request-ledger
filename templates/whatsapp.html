@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}WhatsApp{% endblock %}
+
+{% block content %}
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <a href="/" class="text-sm text-sky-700 hover:underline">&larr; Back to the ledger</a>
+    <h2 class="mt-1 text-xl font-semibold text-slate-900">WhatsApp{% if simulator %} simulator{% endif %}</h2>
+    <p class="text-sm text-slate-500">Every WhatsApp message in either direction: requests, chases, the client's photos and replies.</p>
+  </div>
+</div>
+
+<div class="mt-4 rounded-lg border px-4 py-3 text-sm {{ 'border-emerald-300 bg-emerald-50 text-emerald-950' if not simulator else 'border-sky-300 bg-sky-50 text-sky-950' }}">
+  {% if simulator %}<b>Simulator mode - no WhatsApp provider configured.</b> Nothing leaves this machine. Outbound messages are stored here, and you can play the client below (send photos, PDFs, text or "I don't have this") to see exactly how it lands on the ledger. Set <code>WHATSAPP_PROVIDER</code> and <code>WHATSAPP_TOKEN</code> in <code>.env</code> to go live.
+  {% else %}<b>Live: {{ wa_mode }}.</b> Messages go through your WhatsApp provider; the simulator is off. The webhook is <code>/webhooks/whatsapp/inbound</code>.{% endif %}
+  Photos that arrive one by one are assembled into one submission after {{ assembly_seconds }} s of quiet (or when the client says "done").
+</div>
+
+<div class="mt-4 grid gap-4 lg:grid-cols-[260px_1fr_330px]">
+  {# ---------------- conversations ---------------- #}
+  <aside class="rounded-lg border border-slate-200 bg-white shadow-sm">
+    <h3 class="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-900">Conversations</h3>
+    <ul class="divide-y divide-slate-100">
+      {% for t in threads %}
+      <li>
+        <a href="/whatsapp?phone={{ t.phone|urlencode }}" class="block px-4 py-3 hover:bg-slate-50 {{ 'bg-emerald-50' if t.phone == phone else '' }}">
+          <div class="flex items-center justify-between gap-2"><span class="font-medium text-slate-900">{{ t.phone }}</span>
+            <span class="text-[11px] text-slate-400">{{ t.last.created_at|ist('%d %b %H:%M') }}</span></div>
+          <div class="text-xs text-slate-500">{{ t.who }}</div>
+          <div class="mt-1 flex gap-1.5 text-[11px]">
+            {% if t.unmatched %}<span class="rounded-full bg-amber-100 px-2 py-0.5 font-semibold text-amber-900">{{ t.unmatched }} to assign</span>{% endif %}
+            {% if t.buffered %}<span class="rounded-full bg-sky-100 px-2 py-0.5 font-semibold text-sky-900">{{ t.buffered }} waiting to assemble</span>{% endif %}
+          </div>
+        </a>
+      </li>
+      {% else %}
+      <li class="px-4 py-6 text-sm text-slate-500">No WhatsApp messages yet. Release requests or record a chase on WhatsApp, or send a reply from the simulator.</li>
+      {% endfor %}
+    </ul>
+  </aside>
+
+  {# ---------------- the thread ---------------- #}
+  <section class="rounded-lg border border-slate-200 bg-[#efeae2] shadow-sm">
+    <header class="flex items-center justify-between rounded-t-lg border-b border-slate-200 bg-[#075e54] px-4 py-3 text-white">
+      <div class="font-semibold">{{ phone or 'No conversation selected' }}</div>
+      <div class="text-xs text-emerald-100">{{ conversation|length }} message{{ '' if conversation|length == 1 else 's' }}</div>
+    </header>
+    <div class="max-h-[70vh] space-y-3 overflow-y-auto px-4 py-4" id="wa-thread">
+      {% for m in conversation %}
+      <div class="flex {{ 'justify-end' if m.direction == 'out' else 'justify-start' }}">
+        <div class="max-w-[85%] rounded-lg px-3 py-2 text-sm shadow-sm {{ 'bg-[#d9fdd3]' if m.direction == 'out' else 'bg-white' }}" data-wa-message="{{ m.id }}" data-direction="{{ m.direction }}">
+          <div class="mb-1 flex flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wide">
+            {% if m.direction == 'out' %}
+              <span class="rounded bg-emerald-200 px-1.5 py-0.5 text-emerald-900">{{ m.kind|replace('_', ' ') }}</span>
+              <span class="rounded px-1.5 py-0.5 {{ 'bg-rose-200 text-rose-900' if m.status == 'failed' else 'bg-slate-200 text-slate-700' }}">{{ 'simulated' if m.status == 'simulated' else m.status }}</span>
+            {% else %}
+              <span class="rounded bg-slate-200 px-1.5 py-0.5 text-slate-700">{{ m.sender_name or 'client' }}</span>
+              <span class="rounded px-1.5 py-0.5
+                {{ {'submitted': 'bg-emerald-200 text-emerald-900', 'duplicate': 'bg-amber-200 text-amber-900', 'unavailable': 'bg-fuchsia-200 text-fuchsia-900',
+                    'unmatched': 'bg-amber-300 text-amber-950', 'buffered': 'bg-sky-200 text-sky-900', 'unknown_sender': 'bg-rose-200 text-rose-900', 'failed': 'bg-rose-200 text-rose-900'}.get(m.status, 'bg-slate-200 text-slate-700') }}">{{ m.status|replace('_', ' ') }}</span>
+            {% endif %}
+            {% if m.request_id %}<span class="rounded bg-slate-800 px-1.5 py-0.5 text-white">{{ refs.get(m.request_id, 'request') }}</span>{% endif %}
+          </div>
+          {% if m.body %}<div class="whitespace-pre-wrap break-words text-slate-900">{{ m.body|linkify }}</div>{% endif %}
+          {% if m.media %}
+          <div class="mt-1 flex flex-wrap gap-2">
+            {% for item in m.media %}
+              {% if item.content_type in ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] %}
+              <a href="/whatsapp/media/{{ m.id }}/{{ loop.index0 }}"><img src="/whatsapp/media/{{ m.id }}/{{ loop.index0 }}?inline=1" alt="{{ item.filename }}" class="h-24 w-24 rounded object-cover ring-1 ring-slate-300"></a>
+              {% else %}
+              <a href="/whatsapp/media/{{ m.id }}/{{ loop.index0 }}" class="rounded bg-slate-100 px-2 py-1.5 text-xs font-medium text-sky-800 ring-1 ring-slate-300">&#128206; {{ item.filename }}</a>
+              {% endif %}
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if m.note and m.direction == 'in' %}<div class="mt-1 text-[11px] italic text-slate-500">{{ m.note }}</div>{% endif %}
+          {% if m.status == 'unmatched' %}
+          <div class="mt-2 rounded-md bg-amber-50 p-2 ring-1 ring-amber-200">
+            <div class="text-xs font-semibold text-amber-950">Which request is this for?</div>
+            <div class="mt-1 flex gap-1.5">
+              <select class="assign-select min-w-0 flex-1 rounded border border-slate-300 bg-white px-1.5 py-1 text-xs">
+                {% for r in open_requests %}<option value="{{ r.id }}">{{ r.ref }} - {{ r.document[:40] }}</option>{% endfor %}
+              </select>
+              <button type="button" data-assign="{{ m.id }}" class="rounded bg-amber-600 px-2 py-1 text-xs font-semibold text-white hover:bg-amber-700">Assign</button>
+            </div>
+          </div>
+          {% endif %}
+          <div class="mt-1 text-right text-[10px] text-slate-500" title="{{ m.created_at.isoformat() }}">{{ m.created_at|ist('%d %b %Y, %H:%M:%S') }}</div>
+        </div>
+      </div>
+      {% else %}
+      <p class="py-10 text-center text-sm text-slate-500">Nothing here yet.</p>
+      {% endfor %}
+    </div>
+  </section>
+
+  {# ---------------- simulate the client ---------------- #}
+  <aside class="rounded-lg border border-slate-200 bg-white shadow-sm">
+    <h3 class="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-900">Simulate Client WhatsApp Reply</h3>
+    {% if simulator %}
+    <form id="wa-form" class="space-y-3 px-4 py-4" enctype="multipart/form-data">
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="wa-phone">From (the client's number)</label>
+        <select id="wa-phone" name="phone" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+          {% for k in known %}<option value="{{ k.phone }}" {{ 'selected' if k.phone == phone else '' }}>{{ k.phone }} - {{ k.label }}</option>{% endfor %}
+        </select>
+        {% if not known %}<p class="mt-1 text-xs text-amber-800">No numbers yet - add the client's WhatsApp number under the engagement's Settings.</p>{% endif %}
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="wa-reply">Reply to (optional)</label>
+        <select id="wa-reply" name="reply_to" class="mt-1 w-full rounded-md border border-slate-300 bg-white px-2.5 py-2 text-sm">
+          <option value="">- a new message (include the code, e.g. REQ-001-002) -</option>
+          {% for m in conversation if m.direction == 'out' and m.provider_message_id %}
+          <option value="{{ m.provider_message_id }}">{{ m.created_at|ist('%d %b %H:%M') }} - {{ (m.body or '')[:42] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="wa-text">Message / caption</label>
+        <textarea id="wa-text" name="text" rows="3" class="mt-1 w-full rounded-md border border-slate-300 px-2.5 py-2 text-sm" placeholder="e.g. REQ-001-002 here you go"></textarea>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600" for="wa-files">Photos / PDFs (in order)</label>
+        <input id="wa-files" name="files" type="file" multiple accept="image/*,.pdf" class="mt-1 block w-full text-sm text-slate-700 file:mr-3 file:rounded-md file:border-0 file:bg-slate-900 file:px-3 file:py-2 file:text-sm file:font-medium file:text-white">
+        <label class="mt-2 flex items-start gap-2 text-xs text-slate-600"><input type="checkbox" name="separate" value="1" class="mt-0.5 h-4 w-4 rounded border-slate-300"> Send each file as its own message, like a real phone (they are assembled afterwards)</label>
+      </div>
+      <p id="wa-msg" class="hidden rounded-md px-3 py-2 text-sm"></p>
+      <div class="flex flex-wrap gap-2">
+        <button type="submit" class="rounded-md bg-emerald-600 px-3.5 py-2 text-sm font-semibold text-white hover:bg-emerald-700">Send reply</button>
+        <button type="button" id="wa-unavailable" class="rounded-md border border-fuchsia-300 bg-fuchsia-50 px-3.5 py-2 text-sm font-semibold text-fuchsia-900 hover:bg-fuchsia-100">I don't have this</button>
+      </div>
+      <div class="border-t border-slate-100 pt-3">
+        <button type="button" id="wa-flush" class="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100">Assemble waiting photos now</button>
+        <p class="mt-1 text-[11px] text-slate-500">Or say "done" in a message. Otherwise they assemble by themselves after {{ assembly_seconds }} s.</p>
+      </div>
+    </form>
+    {% else %}
+    <p class="px-4 py-4 text-sm text-slate-600">Replies arrive through the provider's webhook. The simulator is off while a live provider is configured.</p>
+    {% endif %}
+  </aside>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const thread = document.getElementById('wa-thread');
+  if (thread) thread.scrollTop = thread.scrollHeight;
+  const say = (el, text, good) => {
+    el.textContent = text;
+    el.className = 'rounded-md px-3 py-2 text-sm ' + (good ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200' : 'bg-rose-50 text-rose-800 ring-1 ring-rose-200');
+  };
+  async function send(fd, msg, okText) {
+    const res = await fetch('/whatsapp/simulate', { method: 'POST', body: fd });
+    let data = {}; try { data = await res.json(); } catch (e) {}
+    if (!res.ok) { say(msg, data.error || 'That did not work.', false); return; }
+    say(msg, `${okText} (${(data.statuses || []).join(', ')}). Reloading...`, true);
+    setTimeout(() => location.href = '/whatsapp?phone=' + encodeURIComponent(fd.get('phone')), 500);
+  }
+  const form = document.getElementById('wa-form');
+  if (form) {
+    const msg = document.getElementById('wa-msg');
+    form.addEventListener('submit', (e) => { e.preventDefault(); send(new FormData(form), msg, 'Sent'); });
+    document.getElementById('wa-unavailable').addEventListener('click', () => {
+      const fd = new FormData(form); fd.set('action', 'unavailable'); fd.delete('files'); send(fd, msg, 'Sent');
+    });
+    document.getElementById('wa-flush').addEventListener('click', async () => {
+      const res = await fetch('/whatsapp/flush', { method: 'POST' });
+      const data = await res.json();
+      say(msg, `Assembled ${data.assembled.length} batch${data.assembled.length === 1 ? '' : 'es'}. Reloading...`, true);
+      setTimeout(() => location.reload(), 500);
+    });
+  }
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-assign]');
+    if (!btn) return;
+    const actor = currentActor();
+    if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+    const fd = new FormData();
+    fd.set('actor', actor);
+    fd.set('request_id', btn.closest('div').querySelector('.assign-select').value);
+    btn.disabled = true;
+    const res = await fetch(`/whatsapp/messages/${btn.dataset.assign}/assign`, { method: 'POST', body: fd });
+    let data = {}; try { data = await res.json(); } catch (x) {}
+    if (!res.ok) { btn.disabled = false; alert(data.error || 'Could not assign.'); return; }
+    location.reload();
+  });
+})();
+</script>
+{% endblock %}

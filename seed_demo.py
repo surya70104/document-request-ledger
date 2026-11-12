@@ -424,6 +424,14 @@ def _pass1_topup(session, eng) -> None:
             age_warn_days=eng.age_warn_days, age_escalate_days=eng.age_escalate_days,
         )
         print("[seed] set demo client / partner email addresses (change them under Settings)")
+    if not eng.client_whatsapp and eng.status == "Active":
+        services.update_engagement_settings(
+            session, eng.id, client_email=eng.client_email, partner_email=eng.partner_email,
+            age_warn_days=eng.age_warn_days, age_escalate_days=eng.age_escalate_days,
+            client_whatsapp="+91 98765 00001",
+            whatsapp_contacts={"meera shah": "+91 98765 00002", "ravi menon": "+91 98765 00003"},
+        )
+        print("[seed] set demo WhatsApp numbers - open http://127.0.0.1:8015/whatsapp to try the simulator")
     have = {services._normalise_document(r.document) for r in services.engagement_requests(session, eng.id)}
     added = 0
     for document, description, significance, priority, owner in DRAFT_DEMO:

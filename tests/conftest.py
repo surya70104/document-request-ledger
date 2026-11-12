@@ -36,6 +36,10 @@ os.environ["UPLOAD_DIR"] = tempfile.mkdtemp(prefix="ledger_test_uploads_")
 # Never send real email from the tests (even if .env has SMTP settings): local-outbox mode.
 os.environ["SMTP_HOST"] = ""
 os.environ["PUBLIC_BASE_URL"] = "http://testserver"
+# WhatsApp: simulator mode, and no background assembly task (tests assemble explicitly).
+os.environ["WHATSAPP_PROVIDER"] = ""
+os.environ["WHATSAPP_TOKEN"] = ""
+os.environ["WHATSAPP_FLUSH_INTERVAL"] = "0"
 
 
 @pytest.fixture(scope="session", autouse=True)

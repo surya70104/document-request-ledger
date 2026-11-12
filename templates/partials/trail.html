@@ -164,7 +164,7 @@
     <div class="rounded-lg border border-slate-200 bg-white">
       <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-3 py-2">
         <div class="text-sm font-semibold text-slate-900">Attempt {{ sub.attempt_number }}
-          <span class="ml-1 text-xs font-normal text-slate-500">{{ sub.received_at|ist }} · {{ sub.channel }}{% if sub.submitted_by %} · {{ sub.submitted_by }}{% endif %}</span>
+          <span class="ml-1 text-xs font-normal text-slate-500">{{ sub.received_at|ist }} · {% if sub.channel == 'WhatsApp' %}<span class="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-900 ring-1 ring-inset ring-emerald-300">WhatsApp</span>{% else %}{{ sub.channel }}{% endif %}{% if sub.submitted_by %} · {{ sub.submitted_by }}{% endif %}</span>
         </div>
         <div class="flex flex-wrap items-center gap-1.5">
           {% if sub.outcome == 'pending' %}
@@ -297,7 +297,7 @@
         <time class="text-xs text-slate-500" datetime="{{ ev.at.isoformat() }}" title="{{ ev.at.isoformat() }}">{{ ev.at|ist }}</time>
       </div>
       <div class="text-xs text-slate-600">
-        by {{ ev.actor }}{% if ev.channel %} · via {{ ev.channel }}{% endif %}
+        by {{ ev.actor }}{% if ev.channel == 'WhatsApp' %} · <span class="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-900 ring-1 ring-inset ring-emerald-300">WhatsApp</span>{% elif ev.channel %} · via {{ ev.channel }}{% endif %}
       </div>
       {% set ch = chases.get(ev.id) if chases else None %}
       {% if ch %}
