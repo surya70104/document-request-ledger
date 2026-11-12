@@ -37,7 +37,13 @@
 <div class="border-b border-fuchsia-300 bg-fuchsia-50 px-5 py-3 text-sm text-fuchsia-950" id="unavailable-alert">
   <p class="font-semibold">&#9888; The client says they don't have this document.</p>
   <p class="mt-0.5">&ldquo;{{ gone.payload.get('reason', '') }}&rdquo; <span class="text-fuchsia-800">- {{ gone.actor }}, {{ gone.at|ist }}</span></p>
-  <p class="mt-1 text-xs text-fuchsia-900">Decide what to do: waive it, mark it not applicable, or re-request it. It stays open until you do.</p>
+  <p class="mt-1 text-xs text-fuchsia-900">It stays open until you decide: waive it, mark it not applicable, or ask the client again.</p>
+  {% if r.engagement.status == 'Active' %}
+  <div class="mt-2 flex flex-wrap items-center gap-2">
+    <input id="reopen-note" type="text" maxlength="500" class="min-w-0 flex-1 rounded-md border border-fuchsia-300 bg-white px-2.5 py-1.5 text-sm" placeholder="Note (optional), e.g. Client confirmed by phone it exists">
+    <button type="button" data-reopen="{{ r.id }}" class="rounded-md bg-fuchsia-700 px-3 py-1.5 text-sm font-semibold text-white hover:bg-fuchsia-800">Reopen - ask the client again</button>
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -73,6 +79,7 @@
     <h3 class="text-sm font-semibold text-violet-950">Audit review</h3>
     <span class="rounded-full bg-violet-200 px-2 py-0.5 text-xs font-medium text-violet-900">Attempt {{ pend.attempt_number }} awaiting a decision</span>
   </div>
+  {% if can_assemble(pend) and pend.files|length > 1 %}<a href="/submissions/{{ pend.id }}/document.pdf" class="mt-1 inline-block text-xs font-medium text-sky-800 underline">Download all {{ pend.files|length }} pages as one PDF</a>{% endif %}
   <ul class="mt-2 space-y-1 text-sm">
     {% for f in pend.files %}
     <li class="flex flex-wrap items-center gap-x-2">
@@ -171,6 +178,9 @@
           {% endif %}
         </div>
       </div>
+      {% if can_assemble(sub) %}
+      <div class="border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-xs"><a href="/submissions/{{ sub.id }}/document.pdf" class="font-medium text-sky-800 underline">Download {{ 'all ' ~ sub.files|length ~ ' pages' if sub.files|length > 1 else 'the document' }} as one PDF</a><span class="text-slate-500"> - in page order</span></div>
+      {% endif %}
       <ul class="divide-y divide-slate-100">
         {% for f in sub.files %}
         <li class="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-sm">

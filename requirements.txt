@@ -12,3 +12,7 @@ python-multipart>=0.0.9
 # app and tests are synchronous.
 pytest>=8.0,<9.0
 httpx>=0.27,<1.0
+
+# Combining a submission's phone photos / PDFs into one downloadable PDF.
+Pillow>=10.0,<12.0
+pypdf>=4.0,<7.0

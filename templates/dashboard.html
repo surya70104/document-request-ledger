@@ -910,6 +910,23 @@
     }
   });
 
+  // -- Reopen a request the client said they don't have
+  body.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-reopen]');
+    if (!btn) return;
+    const actor = currentActor();
+    if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+    const fd = new FormData();
+    fd.set('event_type', 'CLIENT_UNAVAILABLE_CLEARED'); fd.set('actor', actor);
+    const note = (document.getElementById('reopen-note') || {}).value || '';
+    if (note.trim()) fd.set('note', note.trim());
+    btn.disabled = true;
+    const { ok, data } = await postForm(`/requests/${btn.dataset.reopen}/events`, fd);
+    if (!ok) { btn.disabled = false; alert(data.error || 'Could not reopen the request.'); return; }
+    dirty = true;
+    await loadDrawer(btn.dataset.reopen, "Reopened - the request is back in the client's queue.");
+  });
+
   // -- Engagement settings
   async function openSettings() {
     if (!engId) return;

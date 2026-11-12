@@ -82,13 +82,16 @@ class DuplicateRequestError(LedgerError):
 # create_request(). None of those three can be appended through append_event().
 ALLOWED_NEXT: dict[str, set[str]] = {
     "Drafted": {E.SENT, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE},
-    "Sent": {E.ACKNOWLEDGED, E.SUBMITTED, E.CHASED, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE, E.ARRIVAL},
-    "Acknowledged": {E.SUBMITTED, E.CHASED, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE, E.ARRIVAL},
+    "Sent": {E.ACKNOWLEDGED, E.SUBMITTED, E.CHASED, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE, E.ARRIVAL,
+             E.UNAVAILABLE_CLEARED},
+    "Acknowledged": {E.SUBMITTED, E.CHASED, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE, E.ARRIVAL,
+                     E.UNAVAILABLE_CLEARED},
     "Submitted": {E.UNDER_REVIEW, E.ACCEPTED, E.REJECTED, E.WAIVED, E.UNFULFILLED, E.NOTE, E.ARRIVAL},
     "Under review": {E.ACCEPTED, E.REJECTED, E.WAIVED, E.UNFULFILLED, E.NOTE, E.ARRIVAL},
     "Rejected": {E.RE_REQUESTED},
     "Re-requested": {
         E.ACKNOWLEDGED, E.SUBMITTED, E.CHASED, E.WAIVED, E.NOT_APPLICABLE, E.UNFULFILLED, E.NOTE, E.ARRIVAL,
+        E.UNAVAILABLE_CLEARED,
     },
     "Accepted": {E.NOTE, E.ARRIVAL},
     "Waived": {E.NOTE, E.ARRIVAL},
@@ -104,7 +107,7 @@ SYSTEM_ONLY = {E.DRAFTED, E.RE_REQUESTED, E.UNFULFILLED, E.SUBMITTED, E.ARRIVAL,
 # Display order for the action menu.
 ACTION_ORDER = [
     E.SENT, E.ACKNOWLEDGED, E.CHASED, E.SUBMITTED, E.UNDER_REVIEW,
-    E.ACCEPTED, E.REJECTED, E.WAIVED, E.NOT_APPLICABLE, E.NOTE,
+    E.ACCEPTED, E.REJECTED, E.WAIVED, E.NOT_APPLICABLE, E.UNAVAILABLE_CLEARED, E.NOTE,
 ]
 
 CHANNEL_REQUIRED = {E.SENT, E.CHASED, E.ACKNOWLEDGED, E.SUBMITTED}
@@ -122,6 +125,7 @@ PAYLOAD_KEYS: dict[str, set[str]] = {
     E.WAIVED: {"reason", "note"},
     E.NOT_APPLICABLE: {"reason", "note"},
     E.NOTE: {"note"},
+    E.UNAVAILABLE_CLEARED: {"note"},
 }
 
 
@@ -138,7 +142,10 @@ def available_actions(request: Request) -> list[tuple[str, str]]:
         allowed = ALLOWED_NEXT.get(request.state or "", set()) - SYSTEM_ONLY
         if pending_submission(request):
             allowed = allowed - {E.ACCEPTED, E.REJECTED}  # decided in the Audit Review panel
-    return [(et, EVENT_LABEL[et]) for et in ACTION_ORDER if et in allowed]
+        if not request.reported_unavailable:
+            allowed = allowed - {E.UNAVAILABLE_CLEARED}  # only meaningful after "I don't have this"
+    labels = {**EVENT_LABEL, E.UNAVAILABLE_CLEARED: "Reopen - ask the client again"}
+    return [(et, labels[et]) for et in ACTION_ORDER if et in allowed]
 
 
 # --------------------------------------------------------------------------------------------
@@ -423,6 +430,9 @@ def append_event(
             raise InvalidTransition(
                 f"Cannot record '{EVENT_LABEL[event_type]}' while the request is '{state}'."
             )
+
+        if event_type == E.UNAVAILABLE_CLEARED and not req.reported_unavailable:
+            raise InvalidTransition("The client has not reported this request as unavailable, so there is nothing to reopen.")
 
         if event_type in (E.ACCEPTED, E.REJECTED) and pending_submission(req):
             raise InvalidTransition(
@@ -2165,7 +2175,7 @@ def client_view(session: Session, eng: Engagement, token: ClientToken) -> dict:
     flagged = []
     for req in unavailable:
         ev = req.reported_unavailable
-        flagged.append({"document": req.document, "reason": (ev.payload or {}).get("reason"), "at": ev.at})
+        flagged.append({"id": req.id, "document": req.document, "reason": (ev.payload or {}).get("reason"), "at": ev.at})
     answered = len(received) + len(flagged)
     total = answered + len(open_)
     return {
@@ -2214,6 +2224,32 @@ def client_upload(
         session, request_id, f"{name} (client)" if name else CLIENT_ACTOR, files,
         channel="Tokenised link", submitted_by=name or req.owner_person,
     )
+
+
+def client_clear_unavailable(
+    session: Session, token_str: str, request_id: int, submitted_by: Optional[str] = None
+) -> RequestEvent:
+    """"I found it" / "I clicked that by mistake": the client takes back their "I don't have this".
+    Appends a CLIENT_UNAVAILABLE_CLEARED event (the first report stays in the history) and the
+    request returns to the client's queue."""
+    token, eng = resolve_token(session, token_str)
+    req = session.get(Request, request_id)
+    if req is None or req.engagement_id != eng.id or not token_covers(token, req):
+        raise NotFoundError("That request is not part of this link.")
+    name = _clean(submitted_by)
+    try:
+        locked = _lock_request(session, request_id)
+        if not locked.reported_unavailable:
+            raise InvalidTransition("This request is not marked as something you do not have.")
+        event = _insert_event(
+            session, locked, E.UNAVAILABLE_CLEARED, f"{name} (client)" if name else CLIENT_ACTOR,
+            "Tokenised link", {"note": "The client says they found it / reported it by mistake."}, utcnow(),
+        )
+        session.commit()
+        return event
+    except Exception:
+        session.rollback()
+        raise
 
 
 def client_report_unavailable(
@@ -2473,3 +2509,54 @@ def publish_template_version(
     except Exception:
         session.rollback()
         raise
+
+
+# ---- the pages of a submission, assembled into ONE document ----------------------------------------
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp")
+ASSEMBLE_EXTENSIONS = IMAGE_EXTENSIONS + (".pdf",)
+
+
+def can_assemble(submission: Submission) -> bool:
+    """True when every page is an image or a PDF, so the pages can be combined into one PDF."""
+    return bool(submission.files) and all(f.filename.lower().endswith(ASSEMBLE_EXTENSIONS) for f in submission.files)
+
+
+def assemble_submission_pdf(session: Session, submission_id: int) -> tuple[bytes, str]:
+    """Combine a submission's pages, in page_order, into one PDF: each photo becomes a page (rotated
+    upright from its camera orientation), PDFs are appended as they are. Returns (bytes, filename).
+    The stored originals are never touched."""
+    import io
+
+    from PIL import Image, ImageOps
+    from pypdf import PdfReader, PdfWriter
+
+    sub = session.execute(
+        select(Submission).where(Submission.id == submission_id).options(selectinload(Submission.files))
+    ).scalar_one_or_none()
+    if sub is None:
+        raise NotFoundError(f"Submission {submission_id} does not exist.")
+    if not sub.files:
+        raise LedgerError("This submission has no pages.")
+    root = UPLOAD_DIR.resolve()
+    writer = PdfWriter()
+    for f in sorted(sub.files, key=lambda x: x.page_order):
+        path = (root / f.storage_path).resolve()
+        if root not in path.parents or not path.is_file():
+            raise NotFoundError(f"The stored file '{f.filename}' is missing.")
+        data = path.read_bytes()
+        try:
+            if data[:5] == b"%PDF-":
+                writer.append(PdfReader(io.BytesIO(data)))
+            else:
+                image = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+                buf = io.BytesIO()
+                image.convert("RGB").save(buf, format="PDF", resolution=150.0)
+                writer.append(PdfReader(io.BytesIO(buf.getvalue())))
+        except Exception as exc:  # noqa: BLE001 - an unreadable image or PDF, whatever the library says
+            raise LedgerError(
+                f"Page {f.page_order} ('{f.filename}') is not an image or PDF that can be combined: {exc}"
+            ) from exc
+    out = io.BytesIO()
+    writer.write(out)
+    req = session.get(Request, sub.request_id)
+    return out.getvalue(), f"{req.ref}_attempt{sub.attempt_number}.pdf"

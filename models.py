@@ -55,6 +55,8 @@ class EventType:
     ARRIVAL = "ARRIVAL_RECORDED"  # identical content arrived again (matched on SHA-256)
     # The client said "I don't have this" (with a reason). Information, not a state change.
     CLIENT_UNAVAILABLE = "CLIENT_REPORTED_UNAVAILABLE"
+    # The report was a mistake (the client says they found it) or the firm asks again. Clears the flag.
+    UNAVAILABLE_CLEARED = "CLIENT_UNAVAILABLE_CLEARED"
 
 
 # The eleven lifecycle states, in lifecycle order.
@@ -92,6 +94,7 @@ EVENT_LABEL = {
     EventType.NOTE: "Note",
     EventType.ARRIVAL: "Identical content re-sent",
     EventType.CLIENT_UNAVAILABLE: "Client reported unavailable",
+    EventType.UNAVAILABLE_CLEARED: "Unavailable report cleared",
 }
 
 ALL_EVENT_TYPES = list(EVENT_LABEL.keys())
@@ -327,14 +330,16 @@ class Request(Base):
     @property
     def reported_unavailable(self) -> Optional["RequestEvent"]:
         """The client's "I don't have this" event while it still stands: the request must be open,
-        and no later submission or re-request has superseded it. None otherwise."""
+        and no later submission, re-request or clearing event has superseded it. None otherwise."""
         if not self.is_open:
             return None
         flag = None
         for ev in self.events:
             if ev.event_type == EventType.CLIENT_UNAVAILABLE:
                 flag = ev
-            elif flag is not None and ev.event_type in (EventType.SUBMITTED, EventType.RE_REQUESTED):
+            elif flag is not None and ev.event_type in (
+                EventType.SUBMITTED, EventType.RE_REQUESTED, EventType.UNAVAILABLE_CLEARED
+            ):
                 flag = None
         return flag
 

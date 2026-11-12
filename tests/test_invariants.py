@@ -1032,3 +1032,147 @@ def test_email_reminders_carry_the_owners_own_link(session, make_engagement, mak
     assert f"/c/{scoped.token}" in mail.body
     whole_mail = services.send_client_link(session, eng.id, "Priya")
     assert "Ravi's challans" in whole_mail.body and "Meera's ledger" in whole_mail.body
+
+
+# ============================================================================================
+# Screen 4 audit fixes
+# ============================================================================================
+def test_client_page_uses_the_templates_client_facing_label(session, make_engagement, client):
+    eng = make_engagement()
+    services.generate_requests(session, engagement_id=eng.id, engagement_type="Statutory audit",
+                               actor="P", default_owner="Ravi Menon (Accountant)")
+    tb = next(r for r in services.engagement_requests(session, eng.id) if r.document.startswith("Trial balance"))
+    item = session.get(TemplateItem, tb.template_item_id)
+    assert item.label_text and tb.description == item.label_text, "the request carries the template's label_text"
+    services.append_event(session, tb.id, "SENT", "P", channel="Email")
+    token = services.create_client_token(session, eng.id, "P").token
+
+    page = client.get(f"/c/{token}")
+    assert page.status_code == 200
+    assert item.label_text in page.text, "the client reads the firm-maintained wording"
+    assert page.text.index(item.label_text) < page.text.index(tb.document), "plain label first, document name as the subtitle"
+    for internal in ("v1 ·", "Suppressed", "Included:", "condition", "has_inventory", "Material", "UNFULFILLED", "REQ-"):
+        assert internal not in page.text, f"internal audit term leaked to the client: {internal}"
+
+    # a newly published wording reaches only requests raised afterwards
+    v2 = services.publish_template_version(session, "Statutory audit", "Priya", {item.id: "Your year-end trial balance, please"})
+    later = make_engagement(client_name="Another client")
+    services.generate_requests(session, engagement_id=later.id, engagement_type="Statutory audit", actor="P", default_owner="X (Acc)")
+    new_tb = next(r for r in services.engagement_requests(session, later.id) if r.document.startswith("Trial balance"))
+    assert new_tb.description == "Your year-end trial balance, please"
+    assert services.get_request(session, tb.id).description == item.label_text and v2.version >= 2
+
+
+def test_firm_can_reopen_and_client_can_take_back_i_dont_have_this(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    req = make_request(eng, "Rental agreements", priority=1)
+    other = make_request(eng, "Insurance", priority=2)
+    token = services.create_client_token(session, eng.id, "Priya").token
+
+    def actions():
+        return dict(services.available_actions(services.get_request(session, req.id)))
+
+    assert "CLIENT_UNAVAILABLE_CLEARED" not in actions(), "nothing to reopen yet"
+    with pytest.raises(services.InvalidTransition, match="nothing to reopen"):
+        services.append_event(session, req.id, "CLIENT_UNAVAILABLE_CLEARED", "Priya")
+
+    assert client.post(f"/c/{token}/requests/{req.id}/unavailable", data={"reason": "Not applicable to our business"}).status_code == 200
+    assert services.get_request(session, req.id).reported_unavailable is not None
+    assert actions()["CLIENT_UNAVAILABLE_CLEARED"] == "Reopen - ask the client again"
+    assert req.id not in _cards(client.get(f"/c/{token}").text)
+
+    # the firm reopens it (e.g. after a phone call): back in the client's queue, history intact
+    drawer = client.get(f"/requests/{req.id}/trail").text
+    assert "data-reopen" in drawer and "Reopen - ask the client again" in drawer
+    res = client.post(f"/requests/{req.id}/events", data={"event_type": "CLIENT_UNAVAILABLE_CLEARED", "actor": "Priya",
+                                                          "note": "Client confirmed by phone that it exists"})
+    assert res.status_code == 200
+    got = services.get_request(session, req.id)
+    kinds = [e.event_type for e in got.events]
+    assert kinds[-1] == "CLIENT_UNAVAILABLE_CLEARED"
+    assert kinds.index("CLIENT_REPORTED_UNAVAILABLE") < kinds.index("CLIENT_UNAVAILABLE_CLEARED"), "the original report stays on the ledger"
+    assert got.events[-1].payload["note"] == "Client confirmed by phone that it exists" and got.events[-1].actor == "Priya"
+    assert got.state == "Acknowledged" and got.reported_unavailable is None  # state unchanged by the report and the reopening
+    assert req.id in _cards(client.get(f"/c/{token}").text)
+    assert "data-reopen" not in client.get(f"/requests/{req.id}/trail").text
+    assert "Client says they don't have this" not in client.get(f"/?eng={eng.id}").text
+
+    # or the client clicked it by mistake and takes it back themselves
+    client.post(f"/c/{token}/requests/{req.id}/unavailable", data={"reason": "Pressed the wrong button"})
+    page = client.get(f"/c/{token}")
+    assert "I found it" in page.text and req.id not in _cards(page.text)
+    assert client.post(f"/c/{token}/requests/{other.id}/found").status_code == 400, "only a flagged request can be taken back"
+    assert client.post(f"/c/{token}/requests/{req.id}/found", data={"submitted_by": "Ravi Menon"}).status_code == 200
+    got = services.get_request(session, req.id)
+    assert got.events[-1].event_type == "CLIENT_UNAVAILABLE_CLEARED" and got.events[-1].actor == "Ravi Menon (client)"
+    assert got.reported_unavailable is None and req.id in _cards(client.get(f"/c/{token}").text)
+    assert len([e for e in got.events if e.event_type == "CLIENT_REPORTED_UNAVAILABLE"]) == 2
+
+    # a client can then simply upload it, and a closed engagement refuses everything
+    assert client.post(f"/c/{token}/requests/{req.id}/upload", files={"files": ("r.pdf", b"agreement")}).status_code == 200
+    services.close_engagement(session, eng.id, "Partner")
+    assert client.post(f"/c/{token}/requests/{other.id}/found").status_code == 410
+
+
+def _png(width, height, colour):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), colour).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_pages_assemble_into_one_pdf_in_page_order(session, make_engagement, make_request, client):
+    import io
+
+    from PIL import Image
+    from pypdf import PdfReader
+
+    eng = make_engagement()
+    token = services.create_client_token(session, eng.id, "Priya").token
+    req = make_request(eng, "Twelve-page ledger")
+    # three photos of different sizes, uploaded in a deliberate order: wide, tall-ish, small
+    pics = [("p1.png", _png(300, 150, "red")), ("p2.png", _png(200, 400, "green")), ("p3.png", _png(100, 80, "blue"))]
+    # a phone photo stored sideways with EXIF orientation 6 must come out upright
+    sideways = Image.new("RGB", (300, 100), "yellow")
+    exif = sideways.getexif()
+    exif[274] = 6
+    buf = io.BytesIO()
+    sideways.save(buf, "JPEG", exif=exif)
+    pics.append(("p4.jpg", buf.getvalue()))
+    # and one page that is already a PDF
+    pdf_buf = io.BytesIO()
+    Image.new("RGB", (150, 150), "black").save(pdf_buf, "PDF")
+    pics.append(("p5.pdf", pdf_buf.getvalue()))
+
+    assert client.post(f"/c/{token}/requests/{req.id}/upload",
+                       files=[("files", (n, c)) for n, c in pics]).status_code == 200
+    got = services.get_request(session, req.id)
+    sub = got.submissions[0]
+    assert services.can_assemble(sub) and len(got.submissions) == 1
+
+    res = client.get(f"/submissions/{sub.id}/document.pdf")
+    assert res.status_code == 200 and res.headers["content-type"] == "application/pdf"
+    assert "attachment" in res.headers["content-disposition"] and f"{got.ref}_attempt1.pdf" in res.headers["content-disposition"]
+    pages = PdfReader(io.BytesIO(res.content)).pages
+    assert len(pages) == 5, "five pages, one document"
+    sizes = [(round(float(p.mediabox.width)), round(float(p.mediabox.height))) for p in pages]
+    assert sizes[0][0] > sizes[0][1] and sizes[1][1] > sizes[1][0], "page 1 is the wide photo, page 2 the tall one"
+    assert sizes[0][0] > sizes[2][0] and sizes[3][1] > sizes[3][0], "the sideways phone photo was turned upright"
+    assert sizes[4] == (72, 72) or sizes[4][0] == sizes[4][1], "the PDF page was appended last"
+    # the originals are untouched
+    assert (services.UPLOAD_DIR / sub.files[1].storage_path).read_bytes() == pics[1][1]
+
+    # the firm finds the link in the drawer
+    assert f"/submissions/{sub.id}/document.pdf" in client.get(f"/requests/{req.id}/trail").text
+
+    # a spreadsheet cannot be merged: clear refusal, and no link is offered
+    sheet = make_request(eng, "Trial balance")
+    client.post(f"/c/{token}/requests/{sheet.id}/upload", files=[("files", ("tb.xlsx", b"PK-not-an-image"))])
+    xs = services.get_request(session, sheet.id).submissions[0]
+    assert not services.can_assemble(xs)
+    assert client.get(f"/submissions/{xs.id}/document.pdf").status_code == 400
+    assert f"/submissions/{xs.id}/document.pdf" not in client.get(f"/requests/{sheet.id}/trail").text
+    assert client.get("/submissions/999999/document.pdf").status_code == 404

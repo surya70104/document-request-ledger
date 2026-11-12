@@ -197,6 +197,7 @@ templates.env.globals.update(
     age_crit=services.AGE_CRIT_DAYS,
     firm_name=FIRM_NAME,
     smtp_configured=emailer.smtp_configured,
+    can_assemble=services.can_assemble,
     link_url=emailer.client_link_url,
     profile_fields=PROFILE_FIELDS,
     engagement_types=ENGAGEMENT_TYPES,
@@ -449,6 +450,13 @@ def review_submission(
         session, submission_id, action, actor, reason_code=reason_code, note=note, pages=pages
     )
     return {"ok": True, "appended": [{"seq": ev.seq, "event_type": ev.event_type} for ev in events]}
+
+
+@app.get("/submissions/{submission_id}/document.pdf")
+def submission_as_one_pdf(submission_id: int, session: Session = Depends(get_session)):
+    """The submission's pages, in page order, combined into ONE PDF (photos become pages)."""
+    data, name = services.assemble_submission_pdf(session, submission_id)
+    return Response(data, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.get("/files/{file_id}")
@@ -772,6 +780,15 @@ def client_unavailable(
 ):
     """"I don't have this": appends a CLIENT_REPORTED_UNAVAILABLE event with the client's reason."""
     event = services.client_report_unavailable(session, token, request_id, reason, submitted_by)
+    return JSONResponse({"ok": True, "seq": event.seq}, headers=NO_STORE)
+
+
+@app.post("/c/{token}/requests/{request_id}/found")
+def client_found(
+    token: str, request_id: int, submitted_by: str = Form(""), session: Session = Depends(get_session)
+):
+    """"I found it" / "that was a mistake": the client takes back their "I don't have this"."""
+    event = services.client_clear_unavailable(session, token, request_id, submitted_by)
     return JSONResponse({"ok": True, "seq": event.seq}, headers=NO_STORE)
 
 
