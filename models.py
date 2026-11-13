@@ -7,8 +7,9 @@ Design rules (from the module spec):
   * `request_event` is strictly append-only. There is no UPDATE or DELETE path in the application
     (ORM listeners below refuse them) and PostgreSQL triggers (see database.py) refuse them too.
 """
+import os
 import secrets
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -31,6 +32,25 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, object_sessio
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# --------------------------------------------------------------------------------------------
+# Retention (DPDP Rules 2025 vs SA 230 / NFRA): every stored file carries a basis and a purge date
+# --------------------------------------------------------------------------------------------
+RETENTION_BASES = ("audit_file", "statutory", "none")
+AUDIT_RETENTION_YEARS = 7  # SA 230 and the NFRA audit-file circular
+# 'none' = received, rejected, superseded or never used: there is no basis to keep it.
+NONE_RETENTION_DAYS = int(os.getenv("NONE_RETENTION_DAYS", "30") or 30)  # how long a rejected file lingers
+# A file still awaiting a decision has no basis yet either; this long safety window is its purge date.
+PENDING_RETENTION_DAYS = int(os.getenv("PENDING_RETENTION_DAYS", "180") or 180)
+
+
+def add_years(moment: datetime, years: int) -> datetime:
+    """The same moment `years` later (29 February becomes 28 February in a non-leap year)."""
+    try:
+        return moment.replace(year=moment.year + years)
+    except ValueError:
+        return moment.replace(year=moment.year + years, day=28)
 
 
 # --------------------------------------------------------------------------------------------
@@ -57,6 +77,11 @@ class EventType:
     CLIENT_UNAVAILABLE = "CLIENT_REPORTED_UNAVAILABLE"
     # The report was a mistake (the client says they found it) or the firm asks again. Clears the flag.
     UNAVAILABLE_CLEARED = "CLIENT_UNAVAILABLE_CLEARED"
+    # Provenance and retention facts about a stored file. None of them changes the request's state, and
+    # they may be recorded after close-out (the audit file is assembled, and files expire, afterwards).
+    FILED_TO_BINDER = "FILED_TO_BINDER"
+    FILE_RETENTION_SET = "FILE_RETENTION_SET"
+    FILE_PURGED = "FILE_PURGED"
 
 
 # The eleven lifecycle states, in lifecycle order.
@@ -95,6 +120,9 @@ EVENT_LABEL = {
     EventType.ARRIVAL: "Identical content re-sent",
     EventType.CLIENT_UNAVAILABLE: "Client reported unavailable",
     EventType.UNAVAILABLE_CLEARED: "Unavailable report cleared",
+    EventType.FILED_TO_BINDER: "Filed to SA 230 binder",
+    EventType.FILE_RETENTION_SET: "Retention basis set",
+    EventType.FILE_PURGED: "File erased (retention schedule)",
 }
 
 ALL_EVENT_TYPES = list(EVENT_LABEL.keys())
@@ -430,6 +458,12 @@ class SubmissionFile(Base):
     __tablename__ = "submission_file"
     __table_args__ = (
         UniqueConstraint("request_id", "content_hash", name="uq_submission_file_request_hash"),
+        CheckConstraint("retention_basis IN ('audit_file', 'statutory', 'none')", name="ck_file_retention_basis"),
+        CheckConstraint(
+            "retention_basis <> 'statutory' OR length(btrim(coalesce(retention_obligation, ''))) > 0",
+            name="ck_file_statutory_obligation",
+        ),
+        CheckConstraint("purge_at IS NOT NULL", name="ck_file_has_purge_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -445,7 +479,13 @@ class SubmissionFile(Base):
     storage_path: Mapped[str] = mapped_column(String(500), nullable=False)  # relative to the uploads dir
     page_order: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     retention_basis: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
-    purge_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    purge_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: utcnow() + timedelta(days=PENDING_RETENTION_DAYS),
+    )
+    retention_obligation: Mapped[Optional[str]] = mapped_column(Text)  # the named obligation, for 'statutory'
+    purged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # the file is erased
+    binder_wp_ref: Mapped[Optional[str]] = mapped_column(String(60))  # SA 230 working paper it was filed under
 
     submission: Mapped[Submission] = relationship(back_populates="files")
     arrivals: Mapped[list["Arrival"]] = relationship(
@@ -555,6 +595,48 @@ class WhatsAppMessage(Base):
     sender_name: Mapped[Optional[str]] = mapped_column(String(200))
     created_by: Mapped[Optional[str]] = mapped_column(String(200))
     note: Mapped[Optional[str]] = mapped_column(Text)
+    media_purged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # transit copy erased
+
+
+class BinderDocument(Base):
+    """A document filed into the SA 230 working-paper binder, with its provenance. The rule (spec
+    section 2 / acceptance test 7): every binder document is EITHER a file from an Accepted submission
+    against a request (request_id + submission_file_id) OR explicitly obtained by us with its basis
+    stated - no third option. Enforced here, in the service, and by CHECK and trigger in PostgreSQL.
+    Append-only: a filing is evidence and is never edited."""
+
+    __tablename__ = "binder_document"
+    __table_args__ = (
+        UniqueConstraint("submission_file_id", name="uq_binder_submission_file"),
+        CheckConstraint("source_type IN ('request_submission', 'obtained_by_us')", name="ck_binder_source_type"),
+        CheckConstraint(
+            "(source_type = 'request_submission' AND request_id IS NOT NULL AND submission_file_id IS NOT NULL) "
+            "OR (source_type = 'obtained_by_us' AND request_id IS NULL AND submission_file_id IS NULL "
+            "AND length(btrim(coalesce(obtained_basis, ''))) > 0)",
+            name="ck_binder_provenance",
+        ),
+        CheckConstraint("retention_basis = 'audit_file'", name="ck_binder_retention_basis"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    engagement_id: Mapped[int] = mapped_column(
+        ForeignKey("engagement.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    wp_ref: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(300), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    request_id: Mapped[Optional[int]] = mapped_column(ForeignKey("request.id", ondelete="RESTRICT"))
+    submission_file_id: Mapped[Optional[int]] = mapped_column(ForeignKey("submission_file.id", ondelete="RESTRICT"))
+    obtained_basis: Mapped[Optional[str]] = mapped_column(Text)  # e.g. "Direct pull from GSTN"
+    # An obtained-by-us document may carry its own copy; request documents point at submission_file.
+    filename: Mapped[Optional[str]] = mapped_column(String(300))
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    file_bytes_size: Mapped[Optional[int]] = mapped_column(BigInteger)
+    storage_path: Mapped[Optional[str]] = mapped_column(String(500))
+    retention_basis: Mapped[str] = mapped_column(String(20), nullable=False, default="audit_file")
+    purge_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    filed_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    filed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class ClientToken(Base):
@@ -622,6 +704,6 @@ def _refuse_update_if_modified(mapper, connection, target):  # noqa: ANN001
         _refuse_mutation(mapper, connection, target)
 
 
-for _cls in (RequestTemplate, TemplateItem, RequestSuppression, Arrival, OutboundEmail):
+for _cls in (RequestTemplate, TemplateItem, RequestSuppression, Arrival, OutboundEmail, BinderDocument):
     event.listen(_cls, "before_update", _refuse_update_if_modified)
     event.listen(_cls, "before_delete", _refuse_mutation)

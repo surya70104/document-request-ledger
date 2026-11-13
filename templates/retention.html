@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Retention &amp; DPDP{% endblock %}
+
+{% block content %}
+{% set bases = s.bases %}
+<div class="flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <a href="/" class="text-sm text-sky-700 hover:underline">&larr; Back to the ledger</a>
+    <h2 class="mt-1 text-xl font-semibold text-slate-900">Retention &amp; DPDP</h2>
+    <p class="text-sm text-slate-500">Every stored file carries a retention basis and a purge date. Evidence is kept for the audit-file period; what has no basis to be kept goes on schedule and is erased - with a permanent record that it existed.</p>
+  </div>
+  <button type="button" id="run-purge" class="rounded-md bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700">Run Purge Job Now</button>
+</div>
+
+<div class="mt-4 rounded-lg border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-950">
+  SA 230 and the NFRA audit-file circular require seven years; the DPDP Rules 2025 (substantive obligations from 12 May 2027) require erasure once the purpose is served. Retention required by law is a recognised basis, so the firm must show <b>which basis</b> each document is held on.
+</div>
+
+<div class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4" id="retention-counts">
+  <div class="rounded-lg border border-emerald-200 bg-white px-4 py-3">
+    <div class="text-2xl font-semibold text-emerald-700" data-count="audit_file">{{ bases.audit_file.count }}</div>
+    <div class="text-sm font-medium text-slate-900">Audit file - {{ s.audit_years }} yrs</div>
+    <div class="text-xs text-slate-500">Accepted or filed to the SA 230 binder. Locked.{% if bases.audit_file.earliest %} Earliest: {{ bases.audit_file.earliest|fdate }}{% endif %}</div>
+  </div>
+  <div class="rounded-lg border border-indigo-200 bg-white px-4 py-3">
+    <div class="text-2xl font-semibold text-indigo-700" data-count="statutory">{{ bases.statutory.count }}</div>
+    <div class="text-sm font-medium text-slate-900">Statutory</div>
+    <div class="text-xs text-slate-500">Held under a named legal obligation.{% if bases.statutory.earliest %} Earliest: {{ bases.statutory.earliest|fdate }}{% endif %}</div>
+  </div>
+  <div class="rounded-lg border border-amber-200 bg-white px-4 py-3">
+    <div class="text-2xl font-semibold text-amber-700" data-count="none">{{ bases.none.count }}</div>
+    <div class="text-sm font-medium text-slate-900">None - scheduled for purge</div>
+    <div class="text-xs text-slate-500">Rejected files are erased {{ s.none_days }} days after rejection; undecided files are held ({{ s.pending_days }}-day safety date).{% if s.overdue %} <b class="text-red-700">{{ s.overdue }} overdue - run the job.</b>{% endif %}</div>
+  </div>
+  <div class="rounded-lg border border-slate-200 bg-white px-4 py-3">
+    <div class="text-2xl font-semibold text-slate-700" data-count="erased">{{ s.erased }}</div>
+    <div class="text-sm font-medium text-slate-900">Erased</div>
+    <div class="text-xs text-slate-500">Each one has a FILE_PURGED event on its request. {{ s.whatsapp_copies }} WhatsApp transit cop{{ 'y' if s.whatsapp_copies == 1 else 'ies' }} not yet erased.</div>
+  </div>
+</div>
+
+<p id="purge-result" class="mt-4 hidden rounded-md px-3 py-2 text-sm"></p>
+
+<section class="mt-6">
+  <h3 class="text-sm font-semibold uppercase tracking-wide text-slate-500">Upcoming purges</h3>
+  <div class="mt-2 overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+    <table class="min-w-full divide-y divide-slate-200 text-sm">
+      <thead class="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+        <tr><th class="px-4 py-2.5 font-medium">Request</th><th class="px-4 py-2.5 font-medium">File</th><th class="px-4 py-2.5 font-medium">Why it has no basis</th><th class="px-4 py-2.5 font-medium">Purge date</th></tr>
+      </thead>
+      <tbody class="divide-y divide-slate-100">
+        {% for u in s.upcoming %}
+        <tr>
+          <td class="px-4 py-3"><span class="font-mono text-xs text-slate-500">{{ u.ref }}</span><div class="text-slate-900">{{ u.document }}</div></td>
+          <td class="px-4 py-3 text-xs"><div class="text-slate-800">{{ u.file.filename }}</div><div class="font-mono text-slate-400">sha256:{{ u.file.content_hash[:12] }}</div></td>
+          <td class="px-4 py-3 text-xs text-slate-600">{{ 'Rejected - not used as evidence' if u.outcome == 'rejected' else ('Superseded' if u.outcome == 'accepted' else 'Awaiting a decision - held until one is made') }}</td>
+          <td class="whitespace-nowrap px-4 py-3 text-xs">{{ u.file.purge_at|fdate }}
+            <div class="{{ 'font-semibold text-red-700' if u.overdue and not u.held else 'text-slate-500' }}">{{ 'held (undecided)' if u.held and u.overdue else ('due now' if u.overdue else 'in ' ~ u.days_left ~ ' days') }}</div></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="px-4 py-8 text-center text-slate-500">Nothing is scheduled for erasure.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('run-purge').addEventListener('click', async (e) => {
+  if (!confirm('Run the retention purge job now?\n\nFiles with no retention basis whose purge date has come are permanently erased from disk. Audit-file and statutory files are never touched. Each erasure is recorded on its request.')) return;
+  e.target.disabled = true;
+  const res = await fetch('/retention/run', { method: 'POST' });
+  const data = await res.json();
+  const box = document.getElementById('purge-result');
+  box.className = 'mt-4 rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-900 ring-1 ring-emerald-200';
+  box.textContent = `Purge job finished: ${data.purged.length} file${data.purged.length === 1 ? '' : 's'} erased` +
+    (data.purged.length ? ' (' + data.purged.map((p) => p.request_ref + ' ' + p.filename).join(', ') + ')' : '') +
+    `; ${data.held_pending} held awaiting a decision; ${data.whatsapp_copies} WhatsApp transit cop${data.whatsapp_copies === 1 ? 'y' : 'ies'} erased` +
+    (data.errors.length ? `; ${data.errors.length} error(s)` : '') + '.';
+  e.target.disabled = false;
+  setTimeout(() => location.reload(), 2500);
+});
+</script>
+{% endblock %}

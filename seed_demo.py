@@ -105,6 +105,7 @@ def backfill_stored_submissions(session) -> int:
                 storage_path=rel,
                 page_order=1,
                 retention_basis="none",
+                purge_at=utcnow() + timedelta(days=180),
             )
         )
         session.add(sub)

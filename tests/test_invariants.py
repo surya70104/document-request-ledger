@@ -1862,3 +1862,369 @@ def test_the_firm_maintains_templates_beyond_wording(session, make_engagement, c
     nothing = client.post("/templates/publish", data=form2)
     assert nothing.status_code == 400 and "nothing to publish" in nothing.json()["error"]
     assert client.post("/templates/publish", data={**form2, "add_document": ["Bad"], "add_condition": ["x y z"]}).status_code == 400
+
+
+# ============================================================================================
+# Stage 8 - SA 230 binder provenance, retention (DPDP) and the Financial Spine hand-off
+# ============================================================================================
+from datetime import timedelta as _td
+
+from models import (AUDIT_RETENTION_YEARS, NONE_RETENTION_DAYS, BinderDocument, SubmissionFile, add_years)
+
+
+def _accepted(session, make_engagement, make_request, *, document="Trial balance as at 31 March 2026",
+              content=b"tb bytes", eng=None, name="tb.xlsx", by="Meera Shah", channel="Tokenised link"):
+    eng = eng or make_engagement()
+    req = make_request(eng, document)
+    sub = services.record_submission(session, req.id, "Client", [(name, content)], channel=channel,
+                                     submitted_by=by)["submission"]
+    services.review_submission(session, sub.id, "accept", "Reviewer")
+    f = services.get_request(session, req.id).submissions[0].files[0]
+    return eng, req, f
+
+
+def _file(session, file_id):
+    session.expire_all()
+    return session.get(SubmissionFile, file_id)
+
+
+# --------------------------------------------------------------------------------------------
+# Acceptance test 7 - every binder document carries a request or an explicit obtained-by-us flag
+# --------------------------------------------------------------------------------------------
+def test_7_binder_document_needs_a_request_or_obtained_by_us(session, engine_db, make_engagement, make_request, client):
+    eng, req, f = _accepted(session, make_engagement, make_request)
+    pending_req = make_request(eng, "Still under review")
+    pending_sub = services.record_submission(session, pending_req.id, "C", [("p.pdf", b"pending")])["submission"]
+    pending_file = services.get_request(session, pending_req.id).submissions[0].files[0]
+    other_eng, other_req, other_file = _accepted(session, make_engagement, make_request, content=b"other")
+
+    # ---- the service refuses a defect, whatever it is
+    for kwargs, msg in [
+        (dict(), "defect"),                                                    # neither
+        (dict(request_id=req.id), "defect"),                                   # a request without the file
+        (dict(submission_file_id=f.id), "defect"),                             # a file without the request
+        (dict(obtained_by_us=True), "basis"),                                  # obtained by us, no basis
+        (dict(obtained_by_us=True, obtained_basis="   "), "basis"),
+        (dict(obtained_by_us=True, obtained_basis="GSTN", request_id=req.id, submission_file_id=f.id), "pick one"),
+        (dict(request_id=req.id, submission_file_id=pending_file.id), "does not belong"),
+        (dict(request_id=pending_req.id, submission_file_id=pending_file.id), "Accepted submission"),
+        (dict(request_id=other_req.id, submission_file_id=other_file.id), "not part of this engagement"),
+    ]:
+        with pytest.raises(services.LedgerError, match=msg):
+            services.file_binder_document(session, eng.id, "WP-B10", "Priya", **kwargs)
+    with pytest.raises(services.LedgerError, match="working paper reference"):
+        services.file_binder_document(session, eng.id, " ", "Priya", request_id=req.id, submission_file_id=f.id)
+    assert _file(session, f.id).binder_wp_ref is None
+
+    # ---- PostgreSQL refuses it too (CHECK constraint and trigger), without going through the service
+    session.rollback()
+    base = {"e": eng.id, "r": req.id, "f": f.id, "pr": pending_req.id, "pf": pending_file.id, "oe": other_eng.id}
+    insert = ("INSERT INTO binder_document (engagement_id, wp_ref, title, source_type, request_id, submission_file_id, "
+              "obtained_basis, retention_basis, purge_at, filed_by, filed_at) VALUES "
+              "(:eng, 'WP-X', 't', :src, :req, :file, :basis, 'audit_file', now() + interval '7 years', 'x', now())")
+    defects = [
+        ("ck_binder_provenance", dict(eng=eng.id, src="request_submission", req=None, file=None, basis=None)),   # neither
+        ("ck_binder_provenance", dict(eng=eng.id, src="request_submission", req=req.id, file=None, basis=None)),
+        ("ck_binder_provenance", dict(eng=eng.id, src="obtained_by_us", req=None, file=None, basis="")),          # no basis
+        ("ck_binder_provenance", dict(eng=eng.id, src="obtained_by_us", req=None, file=None, basis="   ")),
+        ("ck_binder_provenance", dict(eng=eng.id, src="obtained_by_us", req=req.id, file=f.id, basis="GSTN")),    # third option
+        ("ck_binder_(provenance|source_type)", dict(eng=eng.id, src="somewhere_else", req=None, file=None, basis="x")),
+        ("Accepted submission", dict(eng=eng.id, src="request_submission", req=pending_req.id, file=pending_file.id, basis=None)),
+        ("Accepted submission", dict(eng=other_eng.id, src="request_submission", req=req.id, file=f.id, basis=None)),
+    ]
+    for expected, params in defects:
+        with pytest.raises(DBAPIError, match=expected):
+            with engine_db.begin() as conn:
+                conn.execute(text(insert), params)
+
+    # ---- a valid filing from an accepted request succeeds and makes the file an audit file
+    filed = services.file_to_binder(session, f.id, "WP-B10", "Priya")
+    assert (filed.source_type, filed.request_id, filed.submission_file_id, filed.wp_ref) == ("request_submission", req.id, f.id, "WP-B10")
+    stored = _file(session, f.id)
+    assert stored.binder_wp_ref == "WP-B10" and stored.retention_basis == "audit_file"
+    assert abs((stored.purge_at - add_years(filed.filed_at, AUDIT_RETENTION_YEARS)).total_seconds()) < 5, "seven years from filing"
+    last = services.get_request(session, req.id).events[-1]
+    assert last.event_type == "FILED_TO_BINDER" and last.payload["wp_ref"] == "WP-B10" and last.payload["sha256"] == f.content_hash
+    with pytest.raises(services.LedgerError, match="already filed under WP-B10"):
+        services.file_to_binder(session, f.id, "WP-B11", "Priya")
+
+    # ---- a valid obtained-by-us filing succeeds, with its basis and (optionally) its file
+    got = services.file_binder_document(
+        session, eng.id, "WP-C1", "Priya", title="GSTR-2B download", obtained_by_us=True,
+        obtained_basis="Direct pull from GSTN portal by the audit senior", upload=("gstr2b.json", b'{"b2b": []}'))
+    assert (got.source_type, got.request_id, got.submission_file_id, got.retention_basis) == ("obtained_by_us", None, None, "audit_file")
+    assert got.obtained_basis.startswith("Direct pull from GSTN") and got.content_hash == services.sha256_hex(b'{"b2b": []}')
+    assert abs((got.purge_at - add_years(got.filed_at, 7)).total_seconds()) < 5
+    assert (services.UPLOAD_DIR / got.storage_path).read_bytes() == b'{"b2b": []}'
+
+    # ---- a filing is evidence: it cannot be edited or removed
+    session.rollback()
+    for statement in ("UPDATE binder_document SET wp_ref = 'WP-Z' WHERE id = :i", "DELETE FROM binder_document WHERE id = :i"):
+        with pytest.raises(DBAPIError):
+            with engine_db.begin() as conn:
+                conn.execute(text(statement), {"i": filed.id})
+    with pytest.raises(DBAPIError):  # the same file cannot be filed twice, even around the service
+        with engine_db.begin() as conn:
+            conn.execute(text(insert), dict(eng=eng.id, src="request_submission", req=req.id, file=f.id, basis=None))
+
+    # ---- the screen shows the exact provenance; the HTTP layer refuses defects
+    page = client.get(f"/binder?eng={eng.id}").text
+    assert "WP-B10" in page and f"Request {req.ref}" in page and "Obtained by us" in page and "Direct pull from GSTN" in page
+    assert "sha256:" + f.content_hash[:16] in page
+    assert client.post("/binder/file", data={"submission_file_id": f.id, "wp_ref": "", "actor": "P"}).status_code == 400
+    assert client.post("/binder/file", data={"submission_file_id": pending_file.id, "wp_ref": "WP-9", "actor": "P"}).status_code == 400
+    assert client.post("/binder/obtained", data={"engagement_id": eng.id, "wp_ref": "WP-D", "obtained_basis": "", "actor": "P"}).status_code == 400
+    assert client.post("/binder/obtained", data={"engagement_id": eng.id, "wp_ref": "WP-D", "obtained_basis": "Pulled from TRACES", "actor": "P"}).status_code == 200
+
+    # ---- the audit file is assembled after the report date: filing still works once the engagement is closed
+    late_req = make_request(eng, "Late evidence")
+    late_sub = services.record_submission(session, late_req.id, "C", [("late.pdf", b"late")])["submission"]
+    services.review_submission(session, late_sub.id, "accept", "R")
+    late_file = services.get_request(session, late_req.id).submissions[0].files[0]
+    services.close_engagement(session, eng.id, "Partner")
+    services.file_to_binder(session, late_file.id, "WP-B11", "Priya")
+    assert services.get_request(session, late_req.id).events[-1].event_type == "FILED_TO_BINDER"
+    session.rollback()
+    with pytest.raises(DBAPIError, match="closed"):  # but nothing else may be written to a closed engagement
+        with engine_db.begin() as conn:
+            conn.execute(text("INSERT INTO request_event (request_id, seq, event_type, actor, at, payload) "
+                              "VALUES (:r, 999, 'NOTE', 'x', now(), CAST('{}' AS jsonb))"), {"r": late_req.id})
+
+
+# --------------------------------------------------------------------------------------------
+# Acceptance test 9 - every stored file has a retention basis and a purge date; the job erases 'none' files
+# --------------------------------------------------------------------------------------------
+def test_9_retention_purge_erases_expired_none_files_and_logs_it(session, engine_db, make_engagement, make_request, client):
+    eng = make_engagement()
+    req = make_request(eng, "Bank statements")
+    t0 = utcnow()
+
+    # every stored file has a basis and a purge date from the moment it is stored
+    first = services.record_submission(session, req.id, "Client", [("wrong-year.pdf", b"statement for the wrong year")])["submission"]
+    pending = services.get_request(session, req.id).submissions[0].files[0]
+    assert pending.retention_basis == "none" and pending.purge_at is not None
+    assert pending.purge_at > t0 + _td(days=100), "a file awaiting a decision has a long safety date, not the short one"
+
+    # rejected: no basis to keep it - on the purge schedule, NONE_RETENTION_DAYS after the rejection
+    review_at = utcnow() + _td(seconds=1)
+    services.review_submission(session, first.id, "reject", "Reviewer", reason_code="WRONG_PERIOD", at=review_at)
+    rejected = _file(session, pending.id)
+    assert rejected.retention_basis == "none" and rejected.purged_at is None
+    assert rejected.purge_at == review_at + _td(days=NONE_RETENTION_DAYS) and NONE_RETENTION_DAYS == 30
+
+    # accepted: an audit file, seven years
+    second = services.record_submission(session, req.id, "Client", [("right-year.pdf", b"the right statement")],
+                                        at=review_at + _td(seconds=1))["submission"]
+    accept_at = review_at + _td(seconds=2)
+    services.review_submission(session, second.id, "accept", "Reviewer", at=accept_at)
+    good = [f for s in services.get_request(session, req.id).submissions for f in s.files if f.filename == "right-year.pdf"][0]
+    assert good.retention_basis == "audit_file" and good.purge_at == add_years(accept_at, 7)
+
+    # a rejected file that is not yet due, and an accepted one, are never erased
+    out = services.run_retention_purge(session, now=review_at + _td(days=29))
+    assert rejected.id not in [p["file_id"] for p in out["purged"]] and (services.UPLOAD_DIR / rejected.storage_path).exists()
+
+    # due: the bytes go, purged_at is set, and the request keeps an immutable record that it existed
+    due = review_at + _td(days=31)
+    out = services.run_retention_purge(session, now=due)
+    assert rejected.id in [p["file_id"] for p in out["purged"]] and good.id not in [p["file_id"] for p in out["purged"]]
+    assert out["errors"] == []
+    assert not (services.UPLOAD_DIR / rejected.storage_path).exists(), "removed from disk"
+    gone = _file(session, rejected.id)
+    assert gone.purged_at == due and gone.content_hash == pending.content_hash, "the record, and the hash, remain"
+    event = services.get_request(session, req.id).events[-1]
+    assert event.event_type == "FILE_PURGED" and event.actor == "Retention job"
+    assert event.payload["filename"] == "wrong-year.pdf" and event.payload["sha256"] == pending.content_hash
+    assert event.payload["basis"] == "none" and "DPDP" in event.payload["message"] and "rejected" in event.payload["message"]
+    seqs = [e.seq for e in services.get_request(session, req.id).events]
+    assert seqs == list(range(1, len(seqs) + 1)), "the log stays gap-free"
+
+    # the audit file is untouched - even twenty years on
+    out = services.run_retention_purge(session, now=due + _td(days=365 * 20))
+    assert good.id not in [p["file_id"] for p in out["purged"]] and (services.UPLOAD_DIR / good.storage_path).exists()
+    assert _file(session, good.id).purged_at is None and _file(session, good.id).retention_basis == "audit_file"
+    assert rejected.id not in [p["file_id"] for p in services.run_retention_purge(session, now=due)["purged"]], "running it again changes nothing"
+
+    # an erased file cannot be downloaded, filed, or merged
+    assert client.get(f"/files/{rejected.id}").status_code == 410
+    drawer = client.get(f"/requests/{req.id}/trail").text
+    assert "Erased" in drawer and "Audit file - 7 yrs" in drawer and "File to SA 230 Binder" in drawer
+    page = client.get("/retention").text
+    assert "Audit file - 7 yrs" in page and "None - scheduled for purge" in page and "Run Purge Job Now" in page
+
+
+def test_9_retention_guards_hold_in_the_database_and_for_undecided_files(session, engine_db, make_engagement, make_request, client):
+    eng, req, audit = _accepted(session, make_engagement, make_request, document="Payroll", content=b"payroll")
+    other = make_request(eng, "Insurance")
+    services.record_submission(session, other.id, "C", [("ins.pdf", b"insurance")])
+    undecided = services.get_request(session, other.id).submissions[0].files[0]
+    third = make_request(eng, "Not yet due")
+    services.record_submission(session, third.id, "C", [("fresh.pdf", b"fresh")])
+    fresh = services.get_request(session, third.id).submissions[0].files[0]
+    session.rollback()
+
+    # an undecided file past its date is HELD, not erased (nobody has decided it is unused)
+    with engine_db.begin() as conn:
+        conn.execute(text("UPDATE submission_file SET purge_at = now() - interval '1 day' WHERE id = :i"), {"i": undecided.id})
+    out = services.run_retention_purge(session)
+    assert undecided.id not in [p["file_id"] for p in out["purged"]] and out["held_pending"] >= 1
+    assert (services.UPLOAD_DIR / undecided.storage_path).exists()
+
+    session.rollback()
+    rules = [
+        ("audit-file retention basis is locked", "UPDATE submission_file SET retention_basis = 'none' WHERE id = :a"),
+        ("audit-file retention basis is locked", "UPDATE submission_file SET purge_at = purge_at - interval '1 day' WHERE id = :a"),
+        ("audit-file retention basis is locked", "UPDATE submission_file SET purged_at = now() WHERE id = :a"),
+        ("only a file with no retention basis", "UPDATE submission_file SET purged_at = now() WHERE id = :f"),  # purge date still ahead
+        ("re-pointed", "UPDATE submission_file SET content_hash = 'tampered' WHERE id = :u"),
+        ("cannot be deleted", "DELETE FROM submission_file WHERE id = :u"),
+        ("ck_file_statutory_obligation", "UPDATE submission_file SET retention_basis = 'statutory' WHERE id = :u"),
+        ("ck_file_statutory_obligation", "UPDATE submission_file SET retention_basis = 'statutory', retention_obligation = '  ' WHERE id = :u"),
+        ("purge", "UPDATE submission_file SET purge_at = NULL WHERE id = :u"),
+        ("ck_file_retention_basis", "UPDATE submission_file SET retention_basis = 'forever' WHERE id = :u"),
+    ]
+    for expected, statement in rules:
+        with pytest.raises(DBAPIError, match=expected):
+            with engine_db.begin() as conn:
+                conn.execute(text(statement), {"a": audit.id, "u": undecided.id, "f": fresh.id})
+    # a file stored through raw SQL still gets a purge date (the column default); an explicit NULL is refused
+    sub_id = services.get_request(session, other.id).submissions[0].id
+    with engine_db.begin() as conn:
+        conn.execute(text("INSERT INTO submission_file (submission_id, request_id, filename, content_hash, file_bytes_size, "
+                          "storage_path, page_order, retention_basis) VALUES (:s, :r, 'raw', 'rawhash', 1, 'raw/x', 9, 'none')"),
+                     {"s": sub_id, "r": other.id})
+        assert conn.execute(text("SELECT purge_at FROM submission_file WHERE content_hash = 'rawhash'")).scalar_one() is not None
+    # an audit file may be extended, never shortened
+    with engine_db.begin() as conn:
+        conn.execute(text("UPDATE submission_file SET purge_at = purge_at + interval '1 year' WHERE id = :a"), {"a": audit.id})
+
+    # an erased file leaves a permanent record even on a CLOSED engagement (the one event the lock lets through)
+    eng2 = make_engagement()
+    r2 = make_request(eng2, "Wrong thing")
+    s2 = services.record_submission(session, r2.id, "C", [("w.pdf", b"wrong thing")])["submission"]
+    f2 = services.get_request(session, r2.id).submissions[0].files[0]
+    at = utcnow() + _td(seconds=1)
+    services.review_submission(session, s2.id, "reject", "R", reason_code="NOT_THE_DOCUMENT_ASKED_FOR", at=at)
+    services.close_engagement(session, eng2.id, "Partner")
+    out = services.run_retention_purge(session, now=at + _td(days=40))
+    assert f2.id in [p["file_id"] for p in out["purged"]]
+    assert services.get_request(session, r2.id).events[-1].event_type == "FILE_PURGED"
+    assert [e.event_type for e in services.get_request(session, r2.id).events][-2] == "UNFULFILLED_AT_REPORT_DATE"
+
+    # the retention screen and the job over HTTP
+    run = client.post("/retention/run")
+    assert run.status_code == 200 and run.json()["ok"] and "ran_at" in run.json()
+    summary = services.retention_summary(session)
+    assert summary["bases"]["audit_file"]["count"] >= 1 and summary["erased"] >= 1 and summary["bases"]["none"]["count"] >= 1
+
+
+def test_9_whatsapp_transit_copies_are_erased_too(session, wa, make_engagement, make_request, client):
+    eng = _wa_eng(make_engagement, wa)
+    stray = services.receive_whatsapp(session, phone=wa.c, media=[_photo(4)], received_at=utcnow() - _td(days=40), final=True)
+    msg = stray["message"]
+    assert stray["status"] == "unmatched"
+    path = services.UPLOAD_DIR / msg.media[0]["path"]
+    assert path.exists()
+    out = services.run_retention_purge(session)
+    assert out["whatsapp_copies"] >= 1 and not path.exists()
+    session.expire_all()
+    assert session.get(WhatsAppMessage, msg.id).media_purged_at is not None
+    assert client.get(f"/whatsapp/media/{msg.id}/0").status_code == 410
+    fresh = services.receive_whatsapp(session, phone=wa.c, media=[_photo(5)], final=True)["message"]
+    assert (services.UPLOAD_DIR / fresh.media[0]["path"]).exists(), "a recent copy is not erased"
+
+
+# --------------------------------------------------------------------------------------------
+# The statutory retention basis
+# --------------------------------------------------------------------------------------------
+def test_statutory_retention_names_the_obligation(session, engine_db, make_engagement, make_request, client):
+    eng = make_engagement()
+    req = make_request(eng, "Books of account")
+    sub = services.record_submission(session, req.id, "C", [("books.pdf", b"books of account")])["submission"]
+    f = services.get_request(session, req.id).submissions[0].files[0]
+    t0 = utcnow()
+
+    for bad, msg in [(dict(obligation="", years=8), "Name the legal obligation"), (dict(obligation="  ", years=8), "Name the legal obligation"),
+                     (dict(obligation="Act", years=0), "between 1 and 30"), (dict(obligation="Act", years=31), "between 1 and 30"),
+                     (dict(obligation="Act", years="many"), "whole number")]:
+        with pytest.raises(services.LedgerError, match=msg):
+            services.set_statutory_retention(session, f.id, actor="Priya", **bad)
+    held = services.set_statutory_retention(session, f.id, "Income Tax Act Sec 44AA - 8 years", 8, "Priya")
+    session.expire_all()
+    held = session.get(SubmissionFile, f.id)
+    assert held.retention_basis == "statutory" and held.retention_obligation == "Income Tax Act Sec 44AA - 8 years"
+    assert abs((held.purge_at - add_years(t0, 8)).total_seconds()) < 10, "purge date computed from the stated period"
+    event = services.get_request(session, req.id).events[-1]
+    assert event.event_type == "FILE_RETENTION_SET" and "Income Tax Act Sec 44AA" in event.payload["obligation"] and event.payload["basis"] == "statutory"
+
+    # the job never touches it - not even when the submission is rejected and the date arrives
+    services.review_submission(session, sub.id, "reject", "R", reason_code="ILLEGIBLE", at=utcnow() + _td(seconds=1))
+    session.expire_all()
+    assert session.get(SubmissionFile, f.id).retention_basis == "statutory", "rejection does not downgrade a statutory hold"
+    out = services.run_retention_purge(session, now=utcnow() + _td(days=365 * 30))
+    assert f.id not in [p["file_id"] for p in out["purged"]] and (services.UPLOAD_DIR / held.storage_path).exists()
+
+    # can be extended, not shortened; an audit file cannot be re-labelled
+    services.set_statutory_retention(session, f.id, "Income Tax Act Sec 44AA - 10 years", 10, "Priya")
+    with pytest.raises(services.LedgerError, match="extended, not shortened"):
+        services.set_statutory_retention(session, f.id, "Income Tax Act Sec 44AA", 2, "Priya")
+    _eng2, _req2, audit = _accepted(session, make_engagement, make_request, content=b"audit bytes")
+    with pytest.raises(services.LedgerError, match="audit file"):
+        services.set_statutory_retention(session, audit.id, "Some Act", 8, "Priya")
+
+    # over HTTP, and the drawer shows the basis and the obligation
+    other = make_request(eng, "More books")
+    services.record_submission(session, other.id, "C", [("more.pdf", b"more books")])
+    f3 = services.get_request(session, other.id).submissions[0].files[0]
+    ok = client.post(f"/files/{f3.id}/retention/statutory", data={"obligation": "Companies Act s.128 - 8 years", "years": 8, "actor": "Priya"})
+    assert ok.status_code == 200 and ok.json()["basis"] == "statutory"
+    assert client.post(f"/files/{f3.id}/retention/statutory", data={"obligation": "", "years": 8, "actor": "Priya"}).status_code == 400
+    drawer = client.get(f"/requests/{other.id}/trail").text
+    assert "Statutory" in drawer and "Companies Act s.128" in drawer
+
+
+# --------------------------------------------------------------------------------------------
+# Financial Spine hand-off
+# --------------------------------------------------------------------------------------------
+def test_financial_spine_handoff_traces_the_accepted_tb_to_its_request(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    token = services.create_client_token(session, eng.id, "Priya").token
+    tb = make_request(eng, "Trial balance as at 31 March 2026", significance="Material",
+                      period_to=date(2026, 3, 31))
+    assert client.post(f"/c/{token}/requests/{tb.id}/upload", files={"files": ("tb_v1.xlsx", b"TB bytes v1")},
+                       data={"submitted_by": "Meera Shah"}).status_code == 200
+    services.review_submission(session, services.get_request(session, tb.id).submissions[0].id, "accept", "Priya Nair")
+    fs = make_request(eng, "Audited financial statements FY 2025-26")
+    services.record_submission(session, fs.id, "Ravi", [("bs.pdf", b"balance sheet"), ("pl.pdf", b"profit and loss")],
+                               channel="Email", submitted_by="Ravi Menon")
+    services.review_submission(session, services.get_request(session, fs.id).submissions[0].id, "accept", "Priya Nair")
+    bank = make_request(eng, "Bank statements - all current accounts")  # accepted, but not a spine document
+    services.review_submission(session, services.record_submission(session, bank.id, "C", [("b.pdf", b"bank")])["submission"].id, "accept", "R")
+    rejected_tb = make_request(eng, "Trial balance - restated draft")
+    services.review_submission(session, services.record_submission(session, rejected_tb.id, "C", [("r.xlsx", b"restated")])["submission"].id,
+                               "reject", "R", reason_code="INCOMPLETE")
+    make_request(eng, "Profit and loss account - awaiting")  # nothing has arrived
+
+    session.rollback()
+    res = client.get(f"/api/engagements/{eng.id}/handoff/financial-spine")
+    assert res.status_code == 200
+    items = {i["request_ref"]: i for i in res.json()["items"]}
+    assert set(items) == {tb.ref, fs.ref}, "only accepted trial balance / financial statements"
+    one = items[tb.ref]
+    sub = services.get_request(session, tb.id).submissions[0]
+    assert one["request_id"] == tb.id and one["kind"] == "trial_balance" and one["period_to"] == "2026-03-31"
+    assert one["submitted_by"] == "Meera Shah" and one["channel"] == "Tokenised link"
+    assert one["received_at"] == sub.received_at.isoformat() and one["accepted_by"] == "Priya Nair"
+    assert one["sha256"] == services.sha256_hex(b"TB bytes v1") == one["files"][0]["sha256"] and one["files"][0]["filename"] == "tb_v1.xlsx"
+    many = items[fs.ref]
+    assert many["kind"] == "financial_statements" and many["sha256"] is None and many["submitted_by"] == "Ravi Menon"
+    assert [f["sha256"] for f in many["files"]] == [services.sha256_hex(b"balance sheet"), services.sha256_hex(b"profit and loss")]
+    assert res.json()["engagement"]["id"] == eng.id
+
+    # both downstream paths answer the same
+    a = client.get(f"/api/engagements/{eng.id}/handoff/eqr-readiness").json()
+    b = client.get(f"/api/engagements/{eng.id}/eqr-readiness").json()
+    assert a == b and a["engagement"]["id"] == eng.id
+    assert client.get(f"/api/engagements/{eng.id}/handoff/unfulfilled").json() == client.get(f"/api/engagements/{eng.id}/unfulfilled").json()
+    assert client.get("/api/engagements/999999/handoff/financial-spine").status_code == 404
+    assert client.get("/api/engagements/999999/handoff/eqr-readiness").status_code == 404

@@ -12,7 +12,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, selectinload
 
 import emailer
@@ -26,6 +27,12 @@ from conditions import (
     normalise_profile,
 )
 from models import (
+    AUDIT_RETENTION_YEARS,
+    BinderDocument,
+    NONE_RETENTION_DAYS,
+    PENDING_RETENTION_DAYS,
+    RETENTION_BASES,
+    add_years,
     Arrival,
     Chase,
     ClientToken,
@@ -105,7 +112,8 @@ ALLOWED_NEXT: dict[str, set[str]] = {
 # Event types a caller may not append directly. SUBMITTED and ARRIVAL_RECORDED are written by
 # record_submission() (a submission always has a file); ACCEPTED/REJECTED of a pending submission
 # go through review_submission().
-SYSTEM_ONLY = {E.DRAFTED, E.RE_REQUESTED, E.UNFULFILLED, E.SUBMITTED, E.ARRIVAL, E.CLIENT_UNAVAILABLE}
+SYSTEM_ONLY = {E.DRAFTED, E.RE_REQUESTED, E.UNFULFILLED, E.SUBMITTED, E.ARRIVAL, E.CLIENT_UNAVAILABLE,
+               E.FILED_TO_BINDER, E.FILE_RETENTION_SET, E.FILE_PURGED}
 
 # Display order for the action menu.
 ACTION_ORDER = [
@@ -608,7 +616,8 @@ def record_submission(
                     file_bytes_size=len(data),
                     storage_path=rel,
                     page_order=page,
-                    retention_basis="none",
+                    retention_basis="none",  # no basis yet: it becomes an audit file if accepted, else it is purged
+                    purge_at=when_ + timedelta(days=PENDING_RETENTION_DAYS),
                 )
                 submission.files.append(sf)
                 session.flush()
@@ -717,6 +726,7 @@ def review_submission(
         if action == "accept":
             events = [_insert_event(session, req, E.ACCEPTED, actor, None, base_payload, at)]
             sub.outcome = "accepted"
+            set_audit_retention(sub.files, at)  # accepted = evidence: held as an audit file, seven years
         else:
             code = (reason_code or "").strip().upper()
             code = REASON_CODE_ALIASES.get(code, code)
@@ -733,6 +743,7 @@ def review_submission(
             )
             sub.outcome = "rejected"
             sub.reason_code = code
+            set_no_basis_retention(sub.files, at)  # rejected = no basis to keep it: on the purge schedule
         sub.reviewed_by = actor
         sub.reviewed_at = at
         sub.review_notes = note
@@ -2664,7 +2675,9 @@ ASSEMBLE_EXTENSIONS = IMAGE_EXTENSIONS + (".pdf",)
 
 def can_assemble(submission: Submission) -> bool:
     """True when every page is an image or a PDF, so the pages can be combined into one PDF."""
-    return bool(submission.files) and all(f.filename.lower().endswith(ASSEMBLE_EXTENSIONS) for f in submission.files)
+    return bool(submission.files) and all(
+        f.filename.lower().endswith(ASSEMBLE_EXTENSIONS) and not f.purged_at for f in submission.files
+    )
 
 
 def assemble_submission_pdf(session: Session, submission_id: int) -> tuple[bytes, str]:
@@ -2683,6 +2696,8 @@ def assemble_submission_pdf(session: Session, submission_id: int) -> tuple[bytes
         raise NotFoundError(f"Submission {submission_id} does not exist.")
     if not sub.files:
         raise LedgerError("This submission has no pages.")
+    if any(f.purged_at for f in sub.files):
+        raise GoneError("Some pages of this submission have been erased under the retention schedule.")
     root = UPLOAD_DIR.resolve()
     writer = PdfWriter()
     for f in sorted(sub.files, key=lambda x: x.page_order):
@@ -3265,3 +3280,367 @@ def whatsapp_known_numbers(session: Session) -> list[dict]:
             if whatsapp.normalise_phone(number):
                 out.append({"phone": whatsapp.normalise_phone(number), "label": f"{name.title()} ({eng.name})"})
     return out
+
+
+# ============================================================================================
+# Pass 2 - the SA 230 binder, retention (DPDP Rules 2025) and the downstream hand-offs
+# ============================================================================================
+class GoneError(LedgerError):
+    """The thing existed and has been lawfully erased (maps to HTTP 410)."""
+
+
+# ---- retention ---------------------------------------------------------------------------------
+def set_audit_retention(files, at: datetime) -> None:
+    """A file that has become evidence (accepted, or filed to the SA 230 binder) is held as an audit
+    file: seven years from `at`. The date can be extended, never shortened (the database insists)."""
+    target = add_years(_aware(at), AUDIT_RETENTION_YEARS)
+    for f in files:
+        if f.purged_at:
+            continue
+        f.purge_at = max(target, _aware(f.purge_at))
+        f.retention_basis = "audit_file"
+        f.retention_obligation = None
+
+
+def set_no_basis_retention(files, at: datetime) -> None:
+    """A file that was rejected or superseded has no basis to be kept: it goes on the purge schedule,
+    NONE_RETENTION_DAYS (default 30) from `at`. Evidence and statutory holds are left alone."""
+    target = _aware(at) + timedelta(days=NONE_RETENTION_DAYS)
+    for f in files:
+        if f.purged_at or f.retention_basis != "none":
+            continue
+        f.purge_at = target
+
+
+def set_statutory_retention(
+    session: Session, file_id: int, obligation: str, years: int, actor: str, at: Optional[datetime] = None
+) -> SubmissionFile:
+    """Hold a file under another specific legal obligation, which must be named (e.g. "Income Tax Act
+    Sec 44AA - 8 years"), for `years` years from now. The basis can be extended later, not shortened."""
+    actor = _require_actor(actor)
+    obligation = _clean(obligation)
+    if not obligation:
+        raise LedgerError("Name the legal obligation the file is held under - a statutory hold needs one.")
+    if len(obligation) > 500:
+        raise LedgerError("The obligation is too long (500 characters maximum).")
+    try:
+        years = int(years)
+    except (TypeError, ValueError) as exc:
+        raise LedgerError("The retention period must be a whole number of years.") from exc
+    if not 1 <= years <= 30:
+        raise LedgerError("A statutory retention period is between 1 and 30 years.")
+    at = _aware(at)
+    try:
+        sf = session.get(SubmissionFile, file_id)
+        if sf is None:
+            raise NotFoundError(f"File {file_id} does not exist.")
+        if sf.purged_at:
+            raise GoneError("This file has already been erased.")
+        if sf.retention_basis == "audit_file":
+            raise LedgerError("This file is held as an audit file (seven years) and cannot be moved to a statutory hold.")
+        target = add_years(at, years)
+        if sf.retention_basis == "statutory" and target < _aware(sf.purge_at):
+            raise LedgerError("A statutory hold can be extended, not shortened.")
+        req = _lock_request(session, sf.request_id)
+        sf.retention_basis, sf.retention_obligation, sf.purge_at = "statutory", obligation, target
+        _insert_event(session, req, E.FILE_RETENTION_SET, actor, None, {
+            "filename": sf.filename, "sha256": sf.content_hash, "basis": "statutory",
+            "obligation": f"{obligation} ({years} year{'s' if years != 1 else ''})", "purge_at": target.date().isoformat(),
+        }, _event_at(req, at))
+        session.commit()
+        return sf
+    except Exception:
+        session.rollback()
+        raise
+
+
+def run_retention_purge(session: Session, now: Optional[datetime] = None, actor: str = "Retention job") -> dict:
+    """The retention purge job (spec section 8, acceptance test 9).
+
+    Erases every stored file whose basis is 'none' and whose purge date has come: the bytes are
+    removed from disk, `purged_at` is set, and an immutable FILE_PURGED event records on the request
+    that the file existed (name, SHA-256, why it had no basis) and was erased. Never touches an
+    audit_file or statutory file, and never a 'none' file whose purge date is still ahead. A file
+    whose submission is still awaiting a decision is held back (counted in `held_pending`) - nobody
+    has yet decided it is unused. The database enforces the same rules independently.
+    Also erases WhatsApp transit copies of photos once the window has passed (the submission keeps its own copy).
+    """
+    now = _aware(now)
+    due = session.execute(
+        select(SubmissionFile.id)
+        .join(Submission, Submission.id == SubmissionFile.submission_id)
+        .where(SubmissionFile.retention_basis == "none", SubmissionFile.purge_at <= now,
+               SubmissionFile.purged_at.is_(None), Submission.outcome != "pending")
+        .order_by(SubmissionFile.purge_at, SubmissionFile.id)
+    ).scalars().all()
+    held = session.execute(
+        select(func.count()).select_from(SubmissionFile)
+        .join(Submission, Submission.id == SubmissionFile.submission_id)
+        .where(SubmissionFile.retention_basis == "none", SubmissionFile.purge_at <= now,
+               SubmissionFile.purged_at.is_(None), Submission.outcome == "pending")
+    ).scalar_one()
+    root = UPLOAD_DIR.resolve()
+    purged, errors = [], []
+    for fid in due:
+        try:
+            sf = session.get(SubmissionFile, fid)
+            req = _lock_request(session, sf.request_id)
+            if sf.purged_at or sf.retention_basis != "none" or _aware(sf.purge_at) > now:
+                session.rollback()
+                continue
+            sub = next(s for s in req.submissions if s.id == sf.submission_id)
+            path = (root / sf.storage_path).resolve()
+            if root not in path.parents:
+                raise LedgerError("The stored path is outside the uploads folder.")
+            path.unlink(missing_ok=True)  # the bytes first: if recording fails, the next run finds it gone
+            sf.purged_at = now
+            why = {"rejected": "rejected", "accepted": "superseded"}.get(sub.outcome, "not used as evidence")
+            _insert_event(session, req, E.FILE_PURGED, actor, None, {
+                "filename": sf.filename, "sha256": sf.content_hash, "submission_id": sub.id, "attempt": sub.attempt_number,
+                "basis": "none", "purge_at": _aware(sf.purge_at).date().isoformat(),
+                "message": f"Erased under the retention schedule (DPDP Rules 2025): the file was {why}, so there "
+                           f"was no basis to keep it. This record is kept to show it existed and was lawfully erased.",
+            }, _event_at(req, now))
+            session.commit()
+            purged.append({"file_id": fid, "request_ref": req.ref, "filename": sf.filename, "sha256": sf.content_hash})
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the run
+            session.rollback()
+            errors.append({"file_id": fid, "error": str(exc)})
+
+    copies = 0
+    for msg in session.execute(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.direction == "in", WhatsAppMessage.media_purged_at.is_(None),
+            WhatsAppMessage.status != "buffered", func.jsonb_array_length(WhatsAppMessage.media) > 0,
+            WhatsAppMessage.created_at <= now - timedelta(days=NONE_RETENTION_DAYS),
+        )
+    ).scalars().all():
+        try:
+            for item in msg.media:
+                path = (root / item["path"]).resolve()
+                if root in path.parents:
+                    path.unlink(missing_ok=True)
+            msg.media_purged_at = now
+            session.commit()
+            copies += 1
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            errors.append({"whatsapp_message_id": msg.id, "error": str(exc)})
+    return {"ran_at": now, "purged": purged, "held_pending": held, "whatsapp_copies": copies, "errors": errors}
+
+
+def retention_summary(session: Session, now: Optional[datetime] = None) -> dict:
+    """What the Retention & DPDP screen shows: files by basis, what is scheduled for erasure, what has been."""
+    now = _aware(now)
+    rows = session.execute(
+        select(SubmissionFile, Submission, Request.ref, Request.document)
+        .join(Submission, Submission.id == SubmissionFile.submission_id)
+        .join(Request, Request.id == SubmissionFile.request_id)
+        .order_by(SubmissionFile.purge_at, SubmissionFile.id)
+    ).all()
+    out = {b: {"count": 0, "earliest": None} for b in RETENTION_BASES}
+    erased, upcoming = 0, []
+    for sf, sub, ref, document in rows:
+        if sf.purged_at:
+            erased += 1
+            continue
+        slot = out[sf.retention_basis]
+        slot["count"] += 1
+        slot["earliest"] = sf.purge_at if slot["earliest"] is None else min(slot["earliest"], sf.purge_at)
+        if sf.retention_basis == "none":
+            upcoming.append({
+                "file": sf, "ref": ref, "document": document, "outcome": sub.outcome,
+                "days_left": (_aware(sf.purge_at) - now).days, "overdue": _aware(sf.purge_at) <= now,
+                "held": sub.outcome == "pending",
+            })
+    copies = session.execute(
+        select(func.count()).select_from(WhatsAppMessage).where(
+            WhatsAppMessage.direction == "in", WhatsAppMessage.media_purged_at.is_(None),
+            func.jsonb_array_length(WhatsAppMessage.media) > 0)
+    ).scalar_one()
+    return {
+        "now": now, "bases": out, "erased": erased, "upcoming": upcoming[:60],
+        "overdue": sum(1 for u in upcoming if u["overdue"] and not u["held"]),
+        "whatsapp_copies": copies, "none_days": NONE_RETENTION_DAYS, "pending_days": PENDING_RETENTION_DAYS,
+        "audit_years": AUDIT_RETENTION_YEARS,
+    }
+
+
+# ---- the SA 230 binder -------------------------------------------------------------------------------
+def file_binder_document(
+    session: Session,
+    engagement_id: int,
+    wp_ref: str,
+    actor: str,
+    *,
+    title: Optional[str] = None,
+    request_id: Optional[int] = None,
+    submission_file_id: Optional[int] = None,
+    obtained_by_us: bool = False,
+    obtained_basis: Optional[str] = None,
+    upload: Optional[tuple] = None,
+    at: Optional[datetime] = None,
+) -> BinderDocument:
+    """File a document into the SA 230 working-paper binder. The only door in, and the rule (spec
+    section 2, acceptance test 7) is absolute - a document is EITHER
+      * a file from an ACCEPTED submission against a request (request_id + submission_file_id), OR
+      * explicitly obtained by us, with the basis stated (`obtained_basis`, e.g. "Direct pull from GSTN"),
+    and there is no third option: a document with neither is a defect and is refused here and by the
+    database. Filing makes the file an audit file: held seven years from the filing."""
+    actor = _require_actor(actor)
+    wp_ref = _clean(wp_ref)
+    if not wp_ref:
+        raise LedgerError("Give the working paper reference (for example WP-B10).")
+    if len(wp_ref) > 60:
+        raise LedgerError("A working paper reference can be at most 60 characters.")
+    obtained_basis = _clean(obtained_basis)
+    if obtained_by_us and (request_id or submission_file_id):
+        raise LedgerError("A document obtained by us cannot also cite a request - pick one source.")
+    if not obtained_by_us and not (request_id and submission_file_id):
+        raise LedgerError(
+            "A binder document must carry a request (with the accepted file) or be explicitly marked as "
+            "obtained by us - a document with neither is a defect."
+        )
+    if obtained_by_us and not obtained_basis:
+        raise LedgerError("State the basis on which we obtained it (for example: direct pull from GSTN / TRACES).")
+    at = _aware(at)
+    written: list[Path] = []
+    try:
+        eng = get_engagement(session, engagement_id)
+        if obtained_by_us:
+            filename = digest = path_rel = size = None
+            if upload is not None:
+                name, data = upload[0], upload[1]
+                if not data:
+                    raise LedgerError("The uploaded file is empty.")
+                if len(data) > MAX_UPLOAD_BYTES:
+                    raise LedgerError(f"The file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+                digest, filename, size = sha256_hex(data), _safe_name(name), len(data)
+                path_rel = f"binder/{uuid.uuid4().hex}/{filename}"
+                (UPLOAD_DIR / path_rel).parent.mkdir(parents=True, exist_ok=True)
+                (UPLOAD_DIR / path_rel).write_bytes(data)
+                written.append(UPLOAD_DIR / path_rel)
+            doc = BinderDocument(
+                engagement_id=eng.id, wp_ref=wp_ref, title=_clean(title) or "Document obtained by us",
+                source_type="obtained_by_us", obtained_basis=obtained_basis, filename=filename, content_hash=digest,
+                file_bytes_size=size, storage_path=path_rel, retention_basis="audit_file",
+                purge_at=add_years(at, AUDIT_RETENTION_YEARS), filed_by=actor, filed_at=at,
+            )
+            session.add(doc)
+            session.commit()
+            return doc
+
+        sf = session.get(SubmissionFile, submission_file_id)
+        if sf is None or sf.request_id != int(request_id):
+            raise LedgerError("That file does not belong to that request.")
+        req = _lock_request(session, sf.request_id)
+        if req.engagement_id != eng.id:
+            raise LedgerError("That request is not part of this engagement.")
+        sub = next(s for s in req.submissions if s.id == sf.submission_id)
+        if sub.outcome != "accepted":
+            raise LedgerError("Only a file from an Accepted submission can be filed to the binder.")
+        if sf.purged_at:
+            raise GoneError("That file has been erased and cannot be filed.")
+        if sf.binder_wp_ref:
+            raise LedgerError(f"That file is already filed under {sf.binder_wp_ref}.")
+        doc = BinderDocument(
+            engagement_id=eng.id, wp_ref=wp_ref, title=_clean(title) or f"{req.document} - {sf.filename}",
+            source_type="request_submission", request_id=req.id, submission_file_id=sf.id,
+            retention_basis="audit_file", purge_at=add_years(at, AUDIT_RETENTION_YEARS), filed_by=actor, filed_at=at,
+        )
+        session.add(doc)
+        sf.binder_wp_ref = wp_ref
+        set_audit_retention([sf], at)
+        _insert_event(session, req, E.FILED_TO_BINDER, actor, None, {
+            "wp_ref": wp_ref, "filename": sf.filename, "sha256": sf.content_hash,
+            "purge_at": add_years(at, AUDIT_RETENTION_YEARS).date().isoformat(),
+        }, _event_at(req, at))
+        session.commit()
+        return doc
+    except Exception as exc:
+        session.rollback()
+        for p in written:
+            p.unlink(missing_ok=True)
+        if isinstance(exc, DBAPIError):
+            raise LedgerError(f"The database refused this filing: {str(exc.orig).splitlines()[0]}") from exc
+        raise
+
+
+def file_to_binder(session: Session, submission_file_id: int, wp_ref: str, actor: str, title: Optional[str] = None) -> BinderDocument:
+    """File one stored file of an accepted submission under a working paper reference."""
+    sf = session.get(SubmissionFile, submission_file_id)
+    if sf is None:
+        raise NotFoundError(f"File {submission_file_id} does not exist.")
+    req = session.get(Request, sf.request_id)
+    return file_binder_document(session, req.engagement_id, wp_ref, actor, title=title,
+                                request_id=sf.request_id, submission_file_id=sf.id)
+
+
+def binder_overview(session: Session, engagement_id: int) -> dict:
+    """The Binder & Provenance screen: every filed working paper with its exact provenance, and the
+    accepted files that have not been filed yet."""
+    docs = session.execute(
+        select(BinderDocument).where(BinderDocument.engagement_id == engagement_id)
+        .order_by(BinderDocument.wp_ref, BinderDocument.id)
+    ).scalars().all()
+    filed = []
+    for d in docs:
+        row = {"doc": d, "request": None, "file": None, "submission": None}
+        if d.source_type == "request_submission":
+            sf = session.get(SubmissionFile, d.submission_file_id)
+            row.update(request=session.get(Request, d.request_id), file=sf, submission=session.get(Submission, sf.submission_id))
+        filed.append(row)
+    unfiled = []
+    for req in engagement_requests(session, engagement_id):
+        for sub in session.execute(select(Submission).where(Submission.request_id == req.id, Submission.outcome == "accepted")).scalars():
+            for sf in session.execute(select(SubmissionFile).where(SubmissionFile.submission_id == sub.id).order_by(SubmissionFile.page_order)).scalars():
+                if not sf.binder_wp_ref and not sf.purged_at:
+                    unfiled.append({"request": req, "submission": sub, "file": sf})
+    return {"engagement": get_engagement(session, engagement_id), "filed": filed, "unfiled": unfiled}
+
+
+# ---- hand-offs ----------------------------------------------------------------------------------------
+_SPINE_KEYWORDS = (
+    ("trial balance", "trial_balance"), ("financial statement", "financial_statements"),
+    ("balance sheet", "financial_statements"), ("profit and loss", "financial_statements"),
+)
+
+
+def spine_kind(document: str) -> Optional[str]:
+    low = (document or "").lower()
+    return next((kind for key, kind in _SPINE_KEYWORDS if key in low), None)
+
+
+def financial_spine_handoff(session: Session, engagement_id: int) -> dict:
+    """What the Financial Spine takes from the ledger (spec section 2): the trial balance and the
+    financial statements that ARRIVED AS A SUBMISSION against a request and were accepted - which
+    request, when it was received, from whom, and the SHA-256 of the exact bytes - so a restated TB can
+    be traced to the day it was received and the person who sent it."""
+    eng = get_engagement(session, engagement_id)
+    items = []
+    for req in engagement_requests(session, engagement_id):
+        kind = spine_kind(req.document)
+        if kind is None:
+            continue
+        for sub in session.execute(
+            select(Submission).where(Submission.request_id == req.id, Submission.outcome == "accepted")
+            .options(selectinload(Submission.files)).order_by(Submission.id)
+        ).scalars():
+            files = [
+                {"file_id": f.id, "filename": f.filename, "page_order": f.page_order, "sha256": f.content_hash,
+                 "bytes": f.file_bytes_size, "retention_basis": f.retention_basis, "binder_wp_ref": f.binder_wp_ref,
+                 "erased": f.purged_at is not None}
+                for f in sub.files
+            ]
+            items.append({
+                "request_id": req.id, "request_ref": req.ref, "document": req.document, "kind": kind,
+                "period_from": req.period_from.isoformat() if req.period_from else None,
+                "period_to": req.period_to.isoformat() if req.period_to else None,
+                "submission_id": sub.id, "attempt": sub.attempt_number,
+                "received_at": _aware(sub.received_at).isoformat(), "channel": sub.channel,
+                "submitted_by": sub.submitted_by, "accepted_by": sub.reviewed_by,
+                "accepted_at": _aware(sub.reviewed_at).isoformat() if sub.reviewed_at else None,
+                "sha256": files[0]["sha256"] if len(files) == 1 else None, "files": files,
+            })
+    items.sort(key=lambda x: x["received_at"], reverse=True)
+    return {"engagement": {"id": eng.id, "name": eng.name, "client": eng.client_name, "status": eng.status}, "items": items}

@@ -40,6 +40,7 @@ os.environ["PUBLIC_BASE_URL"] = "http://testserver"
 os.environ["WHATSAPP_PROVIDER"] = ""
 os.environ["WHATSAPP_TOKEN"] = ""
 os.environ["WHATSAPP_FLUSH_INTERVAL"] = "0"
+os.environ["RETENTION_JOB_INTERVAL"] = "0"
 
 
 @pytest.fixture(scope="session", autouse=True)

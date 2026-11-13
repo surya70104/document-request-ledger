@@ -185,9 +185,19 @@
         {% for f in sub.files %}
         <li class="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-sm">
           <span class="font-mono text-xs text-slate-400">p{{ f.page_order }}</span>
-          <a href="/files/{{ f.id }}" class="font-medium text-sky-800 hover:underline">{{ f.filename }}</a>
+          {% if f.purged_at %}<span class="font-medium text-slate-500 line-through">{{ f.filename }}</span>
+          {% else %}<a href="/files/{{ f.id }}" class="font-medium text-sky-800 hover:underline">{{ f.filename }}</a>{% endif %}
           <span class="text-xs text-slate-500">{{ f.file_bytes_size|fsize }}</span>
           <span class="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] text-slate-100" title="SHA-256 {{ f.content_hash }}">sha256:{{ f.content_hash[:12] }}</span>
+          <div class="w-full pl-6 text-[11px] text-slate-600" data-retention="{{ f.retention_basis }}">
+            {% if f.purged_at %}<span class="rounded-full bg-zinc-200 px-2 py-0.5 font-semibold text-zinc-800">Erased {{ f.purged_at|ist('%d %b %Y') }}</span> under the retention schedule (DPDP Rules 2025); the record that it existed is kept.
+            {% elif f.retention_basis == 'audit_file' %}<span class="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-900">Audit file - 7 yrs</span> held until {{ f.purge_at|fdate }}
+            {% elif f.retention_basis == 'statutory' %}<span class="rounded-full bg-indigo-100 px-2 py-0.5 font-semibold text-indigo-900">Statutory</span> {{ f.retention_obligation }} - until {{ f.purge_at|fdate }}
+            {% else %}<span class="rounded-full bg-amber-100 px-2 py-0.5 font-semibold text-amber-900">None</span> {{ 'scheduled for erasure ' ~ (f.purge_at|fdate) if sub.outcome != 'pending' else 'no decision yet - held; safety date ' ~ (f.purge_at|fdate) }}{% endif %}
+            {% if f.binder_wp_ref %}<span class="ml-1 rounded-full bg-teal-100 px-2 py-0.5 font-semibold text-teal-900">Filed: {{ f.binder_wp_ref }}</span>{% endif %}
+            {% if sub.outcome == 'accepted' and not f.binder_wp_ref and not f.purged_at %}<button type="button" data-file-binder="{{ f.id }}" class="ml-1 rounded border border-teal-600 bg-teal-50 px-2 py-0.5 font-semibold text-teal-900 hover:bg-teal-100">File to SA 230 Binder</button>{% endif %}
+            {% if f.retention_basis == 'none' and not f.purged_at %}<button type="button" data-file-statutory="{{ f.id }}" class="ml-1 text-slate-500 underline hover:text-slate-800">hold under a legal obligation</button>{% endif %}
+          </div>
           {% if f.arrivals %}
           <span class="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 ring-1 ring-inset ring-amber-300"
                 title="Identical content arrived again {{ f.arrivals|length }} time(s)">Re-sent &times;{{ f.arrivals|length }} · arrived {{ 1 + f.arrivals|length }} times</span>

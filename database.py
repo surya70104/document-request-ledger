@@ -114,6 +114,11 @@ _GUARD_DDL = [
     CREATE OR REPLACE FUNCTION ledger_block_closed() RETURNS trigger AS $$
     DECLARE eid integer; eng_status text;
     BEGIN
+        IF TG_TABLE_NAME = 'request_event' THEN
+            IF NEW.event_type IN ('FILED_TO_BINDER', 'FILE_RETENTION_SET', 'FILE_PURGED') THEN
+                RETURN NEW;  -- provenance and retention facts do not reopen a closed engagement
+            END IF;
+        END IF;
         IF TG_TABLE_NAME IN ('request', 'client_token') THEN
             eid := NEW.engagement_id;
         ELSIF TG_TABLE_NAME = 'arrival' THEN
@@ -192,6 +197,71 @@ _GUARD_DDL = [
         BEFORE UPDATE OR DELETE ON whatsapp_message
         FOR EACH ROW EXECUTE FUNCTION ledger_whatsapp_guard();
     """,
+    # SA 230 binder: a document may only be filed from an ACCEPTED submission of a request in the same
+    # engagement (the CHECK constraint covers the "request or obtained-by-us, no third option" rule).
+    """
+    CREATE OR REPLACE FUNCTION ledger_binder_guard() RETURNS trigger AS $$
+    DECLARE ok integer;
+    BEGIN
+        IF NEW.source_type = 'request_submission' AND NEW.submission_file_id IS NOT NULL AND NEW.request_id IS NOT NULL THEN
+            SELECT count(*) INTO ok
+              FROM submission_file sf
+              JOIN submission s ON s.id = sf.submission_id
+              JOIN request r ON r.id = sf.request_id
+             WHERE sf.id = NEW.submission_file_id AND sf.request_id = NEW.request_id
+               AND r.engagement_id = NEW.engagement_id AND s.outcome = 'accepted' AND sf.purged_at IS NULL;
+            IF ok = 0 THEN
+                RAISE EXCEPTION 'A binder document must come from an Accepted submission of a request in this engagement'
+                    USING ERRCODE = 'check_violation';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    "DROP TRIGGER IF EXISTS trg_binder_guard ON binder_document;",
+    """
+    CREATE TRIGGER trg_binder_guard
+        BEFORE INSERT ON binder_document
+        FOR EACH ROW EXECUTE FUNCTION ledger_binder_guard();
+    """,
+    # Retention: an audit-file basis is immovable (it may be extended, never shortened or purged); a file
+    # can only be erased when its basis is 'none' and its purge date has come; an erased file is final;
+    # a working-paper reference is set once; a stored file is never deleted or re-pointed.
+    """
+    CREATE OR REPLACE FUNCTION ledger_retention_guard() RETURNS trigger AS $$
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            RAISE EXCEPTION 'stored file records cannot be deleted' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.purged_at IS NOT NULL THEN
+            RAISE EXCEPTION 'an erased file cannot change' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.content_hash <> OLD.content_hash OR NEW.request_id <> OLD.request_id
+           OR NEW.submission_id <> OLD.submission_id OR NEW.storage_path <> OLD.storage_path THEN
+            RAISE EXCEPTION 'a stored file cannot be re-pointed' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.retention_basis = 'audit_file' AND (
+               NEW.retention_basis <> 'audit_file' OR NEW.purge_at < OLD.purge_at OR NEW.purged_at IS NOT NULL) THEN
+            RAISE EXCEPTION 'an audit-file retention basis is locked for seven years' USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF NEW.purged_at IS NOT NULL AND (OLD.retention_basis <> 'none' OR OLD.purge_at > NEW.purged_at) THEN
+            RAISE EXCEPTION 'only a file with no retention basis can be erased, and only once its purge date has come'
+                USING ERRCODE = 'restrict_violation';
+        END IF;
+        IF OLD.binder_wp_ref IS NOT NULL AND NEW.binder_wp_ref IS DISTINCT FROM OLD.binder_wp_ref THEN
+            RAISE EXCEPTION 'a working-paper reference is set once' USING ERRCODE = 'restrict_violation';
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """,
+    "DROP TRIGGER IF EXISTS trg_retention_guard ON submission_file;",
+    """
+    CREATE TRIGGER trg_retention_guard
+        BEFORE UPDATE OR DELETE ON submission_file
+        FOR EACH ROW EXECUTE FUNCTION ledger_retention_guard();
+    """,
     # Pass 1 completion: a chase row is never deleted and only its delivered / opened flags may
     # change (false -> true).
     """
@@ -219,7 +289,7 @@ _GUARD_DDL = [
     # Stage 2: templates are versioned and immutable; suppression records are append-only.
     *[
         stmt
-        for table in ("request_template", "template_item", "request_suppression", "arrival", "outbound_email")
+        for table in ("request_template", "template_item", "request_suppression", "arrival", "outbound_email", "binder_document")
         for stmt in (
             f"DROP TRIGGER IF EXISTS trg_{table}_immutable ON {table};",
             f"""
@@ -255,6 +325,31 @@ _MIGRATIONS = [
     "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS client_whatsapp VARCHAR(30)",
     "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS whatsapp_contacts JSONB NOT NULL DEFAULT CAST('{}' AS jsonb)",
     "ALTER TABLE chase ADD COLUMN IF NOT EXISTS whatsapp_id INTEGER REFERENCES whatsapp_message(id) ON DELETE RESTRICT",
+    # Pass 2 / retention and the SA 230 binder
+    "ALTER TABLE submission_file ADD COLUMN IF NOT EXISTS retention_obligation TEXT",
+    "ALTER TABLE submission_file ADD COLUMN IF NOT EXISTS purged_at TIMESTAMPTZ",
+    "ALTER TABLE submission_file ADD COLUMN IF NOT EXISTS binder_wp_ref VARCHAR(60)",
+    "ALTER TABLE whatsapp_message ADD COLUMN IF NOT EXISTS media_purged_at TIMESTAMPTZ",
+    "ALTER TABLE submission_file ALTER COLUMN purge_at SET DEFAULT (now() + interval '{pending_days} days')",
+    # Files stored before retention existed get a basis and a date. Accepted -> audit file (7 years from the
+    # review); rejected -> none, erased after the window counted from today (never retroactively at once);
+    # still awaiting a decision -> none, with the long safety window.
+    "UPDATE submission_file sf SET retention_basis = 'audit_file', "
+    "purge_at = COALESCE(s.reviewed_at, now()) + interval '7 years' FROM submission s "
+    "WHERE s.id = sf.submission_id AND s.outcome = 'accepted' AND sf.purge_at IS NULL",
+    "UPDATE submission_file sf SET retention_basis = 'none', "
+    "purge_at = GREATEST(COALESCE(s.reviewed_at, now()), now()) + interval '{none_days} days' FROM submission s "
+    "WHERE s.id = sf.submission_id AND s.outcome = 'rejected' AND sf.purge_at IS NULL",
+    "UPDATE submission_file sf SET retention_basis = 'none', "
+    "purge_at = GREATEST(s.received_at + interval '{pending_days} days', now() + interval '{none_days} days') "
+    "FROM submission s WHERE s.id = sf.submission_id AND sf.purge_at IS NULL",
+    "ALTER TABLE submission_file DROP CONSTRAINT IF EXISTS ck_file_retention_basis",
+    "ALTER TABLE submission_file ADD CONSTRAINT ck_file_retention_basis CHECK (retention_basis IN ('audit_file', 'statutory', 'none'))",
+    "ALTER TABLE submission_file DROP CONSTRAINT IF EXISTS ck_file_statutory_obligation",
+    "ALTER TABLE submission_file ADD CONSTRAINT ck_file_statutory_obligation "
+    "CHECK (retention_basis <> 'statutory' OR length(btrim(coalesce(retention_obligation, ''))) > 0)",
+    "ALTER TABLE submission_file DROP CONSTRAINT IF EXISTS ck_file_has_purge_date",
+    "ALTER TABLE submission_file ADD CONSTRAINT ck_file_has_purge_date CHECK (purge_at IS NOT NULL)",
     "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS published_by VARCHAR(200)",
     "ALTER TABLE request_template ADD COLUMN IF NOT EXISTS change_note TEXT",
     "ALTER TABLE engagement ADD COLUMN IF NOT EXISTS client_email VARCHAR(200)",
@@ -279,7 +374,11 @@ def init_db() -> None:
     with engine.begin() as conn:
         event_types = ", ".join("'" + t + "'" for t in models.ALL_EVENT_TYPES)
         for statement in _MIGRATIONS:
-            conn.execute(text(statement.replace("{event_types}", event_types)))
+            conn.execute(text(
+                statement.replace("{event_types}", event_types)
+                .replace("{none_days}", str(int(models.NONE_RETENTION_DAYS)))
+                .replace("{pending_days}", str(int(models.PENDING_RETENTION_DAYS)))
+            ))
         for statement in _GUARD_DDL:
             conn.execute(text(statement))
 

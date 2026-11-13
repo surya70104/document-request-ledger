@@ -42,11 +42,14 @@ async def lifespan(_: FastAPI):
     services.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     interval = int(os.getenv("WHATSAPP_FLUSH_INTERVAL", "30") or 0)
     flusher = asyncio.create_task(_whatsapp_flusher(interval)) if interval > 0 else None
+    purge_every = int(os.getenv("RETENTION_JOB_INTERVAL", "86400") or 0)
+    purger = asyncio.create_task(_retention_job(purge_every)) if purge_every > 0 else None
     try:
         yield
     finally:
-        if flusher:
-            flusher.cancel()
+        for task in (flusher, purger):
+            if task:
+                task.cancel()
 
 
 def _flush_whatsapp_once() -> None:
@@ -63,6 +66,23 @@ async def _whatsapp_flusher(interval: int) -> None:
             await run_in_threadpool(_flush_whatsapp_once)
         except Exception:  # noqa: BLE001 - never let the background task die
             pass
+
+
+def _purge_once() -> None:
+    with SessionLocal() as session:
+        services.run_retention_purge(session)
+
+
+async def _retention_job(interval: int) -> None:
+    """The retention purge job: erases files that have no basis to be kept once their date has come.
+    Runs shortly after start-up and then every `interval` seconds (RETENTION_JOB_INTERVAL, 0 = off)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await run_in_threadpool(_purge_once)
+        except Exception:  # noqa: BLE001 - never let the background task die
+            pass
+        await asyncio.sleep(interval)
 
 
 app = FastAPI(title="Document Request Ledger - OAK Audit", lifespan=lifespan)
@@ -99,6 +119,9 @@ EVENT_DOT = {
     "UNFULFILLED_AT_REPORT_DATE": "bg-red-600",
     "CHASED": "bg-orange-500",
     "CLIENT_REPORTED_UNAVAILABLE": "bg-fuchsia-500",
+    "FILED_TO_BINDER": "bg-teal-600",
+    "FILE_RETENTION_SET": "bg-teal-400",
+    "FILE_PURGED": "bg-zinc-500",
     "NOTE": "bg-slate-300",
 }
 PAYLOAD_LABELS = {
@@ -130,6 +153,10 @@ PAYLOAD_LABELS = {
     "template": "Chase template",
     "pages": "Missing pages",
     "whatsapp_message": "WhatsApp message",
+    "wp_ref": "Working paper",
+    "basis": "Retention basis",
+    "obligation": "Obligation",
+    "purge_at": "Purge date",
     "escalation": "Escalated to",
     "carried_forward": "Carried forward",
 }
@@ -290,6 +317,11 @@ async def condition_error_handler(_: HttpRequest, exc: ConditionError):
 async def token_error_handler(_: HttpRequest, exc: services.TokenError):
     code = 404 if exc.reason == "invalid" else 410
     return JSONResponse(status_code=code, content={"error": str(exc), "reason": exc.reason})
+
+
+@app.exception_handler(services.GoneError)
+async def gone_handler(_: HttpRequest, exc: services.GoneError):
+    return JSONResponse(status_code=410, content={"error": str(exc)})
 
 
 @app.exception_handler(services.LedgerError)
@@ -495,6 +527,10 @@ def submission_as_one_pdf(submission_id: int, session: Session = Depends(get_ses
 @app.get("/files/{file_id}")
 def download_file(file_id: int, session: Session = Depends(get_session)):
     sf = services.get_submission_file(session, file_id)
+    if sf.purged_at:
+        raise services.GoneError(
+            f"This file was erased on {to_ist(sf.purged_at, '%d %b %Y')} under the retention schedule (DPDP Rules 2025)."
+        )
     root = services.UPLOAD_DIR.resolve()
     path = (root / sf.storage_path).resolve()
     if root not in path.parents or not path.is_file():
@@ -1110,6 +1146,8 @@ def whatsapp_media(message_id: int, index: int, inline: int = 0, session: Sessio
     msg = session.get(services.WhatsAppMessage, message_id)
     if msg is None or not 0 <= index < len(msg.media or []):
         raise services.NotFoundError("That attachment does not exist.")
+    if msg.media_purged_at:
+        raise services.GoneError("This WhatsApp copy was erased under the retention schedule.")
     item = msg.media[index]
     root = services.UPLOAD_DIR.resolve()
     path = (root / item["path"]).resolve()
@@ -1189,6 +1227,7 @@ def template_publish(
     return {"ok": True, "version": tmpl.version, "type": tmpl.engagement_type, "items": len(tmpl.items)}
 
 
+@app.get("/api/engagements/{engagement_id}/handoff/eqr-readiness")
 @app.get("/api/engagements/{engagement_id}/eqr-readiness")
 def api_eqr_readiness(engagement_id: int, session: Session = Depends(get_session)):
     """The hand-off to EQR Readiness: an open (or, once closed, unfulfilled) request that is Material
@@ -1210,6 +1249,7 @@ def api_eqr_readiness(engagement_id: int, session: Session = Depends(get_session
     }
 
 
+@app.get("/api/engagements/{engagement_id}/handoff/unfulfilled")
 @app.get("/api/engagements/{engagement_id}/unfulfilled")
 def api_unfulfilled(engagement_id: int, session: Session = Depends(get_session)):
     """The frozen list of requests unfulfilled at the report date - the input to the opinion (SA 705)
@@ -1231,6 +1271,80 @@ def api_unfulfilled(engagement_id: int, session: Session = Depends(get_session))
             for x in rep["rows"]
         ],
     }
+
+
+@app.get("/api/engagements/{engagement_id}/handoff/financial-spine")
+def api_financial_spine(engagement_id: int, session: Session = Depends(get_session)):
+    """The Financial Spine hand-off: the accepted trial balance / financial statements, each with the
+    request it arrived against, when it was received, from whom, and its SHA-256."""
+    return services.financial_spine_handoff(session, engagement_id)
+
+
+# --------------------------------------------------------------------------------------------
+# Pass 2: the SA 230 binder and retention (DPDP Rules 2025)
+# --------------------------------------------------------------------------------------------
+@app.get("/binder", response_class=HTMLResponse)
+def binder_screen(http_request: HttpRequest, eng: Optional[int] = None, session: Session = Depends(get_session)):
+    """Binder & Provenance: every filed working paper with its exact provenance."""
+    engagements = services.list_engagements(session)
+    chosen = next((e for e in engagements if e.id == eng), engagements[0] if engagements else None)
+    data = services.binder_overview(session, chosen.id) if chosen else None
+    return templates.TemplateResponse(
+        http_request, "binder.html", {"engagements": engagements, "chosen": chosen, "b": data},
+    )
+
+
+@app.post("/binder/file")
+def binder_file(
+    submission_file_id: int = Form(...), wp_ref: str = Form(""), actor: str = Form(""), title: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    """File one file of an accepted submission under a working paper reference."""
+    doc = services.file_to_binder(session, submission_file_id, wp_ref, actor, title)
+    return {"ok": True, "binder_id": doc.id, "wp_ref": doc.wp_ref, "purge_at": doc.purge_at.isoformat()}
+
+
+@app.post("/binder/obtained")
+def binder_obtained(
+    engagement_id: int = Form(...), wp_ref: str = Form(""), title: str = Form(""), obtained_basis: str = Form(""),
+    actor: str = Form(""), file: Optional[UploadFile] = File(None), session: Session = Depends(get_session),
+):
+    """Log a working paper that was obtained by us (not through a request), with its basis."""
+    upload = None
+    if file is not None and file.filename:
+        upload = (file.filename, file.file.read(services.MAX_UPLOAD_BYTES + 1))
+    doc = services.file_binder_document(
+        session, engagement_id, wp_ref, actor, title=title, obtained_by_us=True, obtained_basis=obtained_basis,
+        upload=upload,
+    )
+    return {"ok": True, "binder_id": doc.id, "wp_ref": doc.wp_ref}
+
+
+@app.get("/retention", response_class=HTMLResponse)
+def retention_screen(http_request: HttpRequest, session: Session = Depends(get_session)):
+    """Retention & DPDP: files by retention basis, what is scheduled for erasure, the purge job."""
+    return templates.TemplateResponse(
+        http_request, "retention.html", {"s": services.retention_summary(session)},
+    )
+
+
+@app.post("/retention/run")
+def retention_run(session: Session = Depends(get_session)):
+    """Run the retention purge job now."""
+    out = services.run_retention_purge(session)
+    return {
+        "ok": True, "purged": out["purged"], "held_pending": out["held_pending"],
+        "whatsapp_copies": out["whatsapp_copies"], "errors": out["errors"], "ran_at": out["ran_at"].isoformat(),
+    }
+
+
+@app.post("/files/{file_id}/retention/statutory")
+def retention_statutory(
+    file_id: int, obligation: str = Form(""), years: int = Form(...), actor: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    sf = services.set_statutory_retention(session, file_id, obligation, years, actor)
+    return {"ok": True, "basis": sf.retention_basis, "purge_at": sf.purge_at.isoformat()}
 
 
 @app.get("/health")

@@ -45,6 +45,8 @@
     <div class="flex flex-wrap gap-2">
       <a href="/engagements/{{ selected.id }}/close-out"
          class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Close-out &amp; evidence</a>
+      <a href="/binder?eng={{ selected.id }}"
+         class="rounded-md border border-teal-600 bg-teal-50 px-3 py-2 text-sm font-medium text-teal-900 hover:bg-teal-100">Binder &amp; provenance</a>
       <button id="open-templates" type="button"
               class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100">Templates</button>
     {% if selected.status == 'Active' %}
@@ -940,6 +942,34 @@
     if (!ok) { btn.disabled = false; alert(data.error || 'Could not reopen the request.'); return; }
     dirty = true;
     await loadDrawer(btn.dataset.reopen, "Reopened - the request is back in the client's queue.");
+  });
+
+  // -- SA 230 binder and retention actions inside the drawer
+  body.addEventListener('click', async (e) => {
+    const fileBtn = e.target.closest('[data-file-binder]');
+    const holdBtn = e.target.closest('[data-file-statutory]');
+    if (!fileBtn && !holdBtn) return;
+    const actor = currentActor();
+    if (!actor) { alert("Enter your name in 'Acting as' (top right) first."); return; }
+    const fd = new FormData(); fd.set('actor', actor);
+    let url;
+    if (fileBtn) {
+      const ref = prompt('Working paper reference to file this under (for example WP-B10):');
+      if (!ref || !ref.trim()) return;
+      fd.set('submission_file_id', fileBtn.dataset.fileBinder); fd.set('wp_ref', ref.trim());
+      url = '/binder/file';
+    } else {
+      const obligation = prompt('Which legal obligation requires this file to be kept? (for example: Income Tax Act Sec 44AA)');
+      if (!obligation || !obligation.trim()) return;
+      const years = prompt('For how many years?', '8');
+      if (!years) return;
+      fd.set('obligation', obligation.trim()); fd.set('years', years.trim());
+      url = `/files/${holdBtn.dataset.fileStatutory}/retention/statutory`;
+    }
+    const { ok, data } = await postForm(url, fd);
+    if (!ok) { alert(data.error || 'That was refused.'); return; }
+    dirty = true;
+    await loadDrawer(currentId, fileBtn ? `Filed to the SA 230 binder as <b>${esc(data.wp_ref)}</b> - held as an audit file for seven years.` : 'Held under the named legal obligation.');
   });
 
   // -- Engagement settings
