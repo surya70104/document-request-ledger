@@ -114,8 +114,11 @@ _GUARD_DDL = [
     CREATE OR REPLACE FUNCTION ledger_block_closed() RETURNS trigger AS $$
     DECLARE eid integer; eng_status text;
     BEGIN
-        IF TG_TABLE_NAME = 'request' THEN
+        IF TG_TABLE_NAME IN ('request', 'client_token') THEN
             eid := NEW.engagement_id;
+        ELSIF TG_TABLE_NAME = 'arrival' THEN
+            SELECT r.engagement_id INTO eid FROM submission_file sf JOIN request r ON r.id = sf.request_id
+                WHERE sf.id = NEW.submission_file_id;
         ELSE
             SELECT engagement_id INTO eid FROM request WHERE id = NEW.request_id;
         END IF;
@@ -130,7 +133,7 @@ _GUARD_DDL = [
     """,
     *[
         stmt
-        for table in ("request", "request_event", "submission")
+        for table in ("request", "request_event", "submission", "submission_file", "arrival", "chase", "client_token")
         for stmt in (
             f"DROP TRIGGER IF EXISTS trg_{table}_closed_readonly ON {table};",
             f"""
@@ -140,6 +143,14 @@ _GUARD_DDL = [
             """,
         )
     ],
+    # A client link cannot be issued or changed (revoked) once the engagement is closed; closing
+    # revokes the live links in the same transaction, before the status flips.
+    "DROP TRIGGER IF EXISTS trg_client_token_closed_update ON client_token;",
+    """
+    CREATE TRIGGER trg_client_token_closed_update
+        BEFORE UPDATE ON client_token
+        FOR EACH ROW EXECUTE FUNCTION ledger_block_closed();
+    """,
     """
     CREATE OR REPLACE FUNCTION ledger_block_closed_engagement() RETURNS trigger AS $$
     BEGIN

@@ -322,7 +322,8 @@ def dashboard(http_request: HttpRequest, eng: Optional[int] = None, session: Ses
     return templates.TemplateResponse(
         http_request,
         "dashboard.html",
-        {"cards": cards, "selected": selected, "requests": requests, "stats": stats, "now": utcnow()},
+        {"cards": cards, "selected": selected, "requests": requests, "stats": stats, "now": utcnow(),
+         "eqr": services.eqr_gate(requests, closed=selected.status == "Closed") if selected else None},
     )
 
 
@@ -1148,12 +1149,88 @@ def template_publish(
     note: str = Form(""),
     item_id: list[int] = Form([]),
     label: list[str] = Form([]),
+    significance: list[str] = Form([]),
+    priority: list[str] = Form([]),
+    condition: list[str] = Form([]),
+    remove: list[int] = Form([]),
+    add_document: list[str] = Form([]),
+    add_label: list[str] = Form([]),
+    add_significance: list[str] = Form([]),
+    add_priority: list[str] = Form([]),
+    add_condition: list[str] = Form([]),
+    add_period: list[str] = Form([]),
     session: Session = Depends(get_session),
 ):
-    if len(item_id) != len(label):
+    """Publish the next version of a template: wording, significance, priority, conditions, removed
+    and added items. The parallel lists carry one entry per item, in the same order."""
+    n = len(item_id)
+    if not (len(label) == n and len(significance) in (0, n) and len(priority) in (0, n) and len(condition) in (0, n)):
         raise services.LedgerError("The form was incomplete - reload the template manager and try again.")
-    tmpl = services.publish_template_version(session, etype, actor, dict(zip(item_id, label)), note)
-    return {"ok": True, "version": tmpl.version, "type": tmpl.engagement_type}
+    item_edits = {}
+    for i, iid in enumerate(item_id):
+        edits = {}
+        if significance:
+            edits["significance"] = significance[i]
+        if priority:
+            edits["priority"] = priority[i]
+        if condition:
+            edits["condition"] = condition[i]
+        item_edits[iid] = edits
+    additions = [
+        {"document": add_document[i], "label": (add_label + [""] * 99)[i],
+         "significance": (add_significance + [""] * 99)[i], "priority": (add_priority + [""] * 99)[i],
+         "condition": (add_condition + [""] * 99)[i], "period": (add_period + [""] * 99)[i]}
+        for i in range(len(add_document))
+    ]
+    tmpl = services.publish_template_version(
+        session, etype, actor, dict(zip(item_id, label)), note,
+        item_edits=item_edits, removals=set(remove), additions=additions,
+    )
+    return {"ok": True, "version": tmpl.version, "type": tmpl.engagement_type, "items": len(tmpl.items)}
+
+
+@app.get("/api/engagements/{engagement_id}/eqr-readiness")
+def api_eqr_readiness(engagement_id: int, session: Session = Depends(get_session)):
+    """The hand-off to EQR Readiness: an open (or, once closed, unfulfilled) request that is Material
+    to the opinion is a BLOCKER, not a line in an admin list."""
+    eng = services.get_engagement(session, engagement_id)
+    requests = services.engagement_requests(session, engagement_id)
+    gate = services.eqr_gate(requests, closed=eng.status == "Closed")
+    now = utcnow()
+    return {
+        "engagement": {"id": eng.id, "name": eng.name, "status": eng.status},
+        "passed": gate["passed"],
+        "blocked": gate["blocked"],
+        "message": gate["message"],
+        "blockers": [
+            {"ref": r.ref, "document": r.document, "owner": r.owner_person, "state": r.state,
+             "age_days": r.age_days(now), "chases": r.chase_count, "attempts": r.attempt_count}
+            for r in gate["requests"]
+        ],
+    }
+
+
+@app.get("/api/engagements/{engagement_id}/unfulfilled")
+def api_unfulfilled(engagement_id: int, session: Session = Depends(get_session)):
+    """The frozen list of requests unfulfilled at the report date - the input to the opinion (SA 705)
+    and written-representation (SA 580) modules. Before close-out it is a preview."""
+    rep = services.closeout_report(session, engagement_id)
+    eng = rep["engagement"]
+    return {
+        "engagement": {"id": eng.id, "name": eng.name, "status": eng.status},
+        "frozen": rep["closed"],
+        "report_date": rep["report_date"].isoformat() if rep["report_date"] else None,
+        "closed_at": eng.closed_at.isoformat() if eng.closed_at else None,
+        "counts": rep["counts"],
+        "effects": rep["effects"],
+        "items": [
+            {"ref": x["ref"], "document": x["document"], "period": x["period"], "owner": x["owner"],
+             "significance": x["significance"], "chases": x["chases"], "attempts": x["attempts"],
+             "requested_on": x["requested_on"].isoformat(), "state_when_frozen": x["frozen_from"],
+             "effect": x["effect"], "effect_label": x["effect_label"]}
+            for x in rep["rows"]
+        ],
+    }
 
 
 @app.get("/health")

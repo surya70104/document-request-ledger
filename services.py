@@ -793,6 +793,11 @@ def close_engagement(
             )
             frozen.append(req)
 
+        # Client links die with the engagement (before the status flips, while the row may still change).
+        for link in session.execute(
+            select(ClientToken).where(ClientToken.engagement_id == engagement_id, ClientToken.revoked_at.is_(None))
+        ).scalars():
+            link.revoked_at = at
         eng.status = "Closed"
         eng.closed_at = at
         eng.report_date = report_date
@@ -1724,9 +1729,26 @@ def _period_phrase(pf: Optional[date], pt: Optional[date]) -> str:
     return "no period specified"
 
 
+def report_effect(req: Request) -> tuple[str, str, str]:
+    """What an unfulfilled request does to the audit report (spec, Screen 5): (key, headline, detail).
+      scope           a Material request: a scope limitation to consider (SA 705)
+      representation  a Routine request that was asked for: a representation to obtain (SA 580)
+      nothing         a request that was never released to the client: nothing was asked, so no effect"""
+    if req.sent_at is None:
+        return "nothing", "Nothing", "Never sent to the client, so nothing was asked and nothing is outstanding."
+    if req.significance == "Material":
+        return ("scope", "Scope limitation to consider",
+                "Material to the opinion: consider a modification for inability to obtain evidence (SA 705).")
+    return "representation", "Representation to obtain", "Ask management to represent that it was not provided (SA 580)."
+
+
 def _unfulfilled_row(req: Request, now: datetime) -> dict:
     frozen = next((ev for ev in reversed(req.events) if ev.event_type == E.UNFULFILLED), None)
+    effect, effect_label, effect_note = report_effect(req)
     return {
+        "effect": effect,
+        "effect_label": effect_label,
+        "effect_note": effect_note,
         "req": req,
         "id": req.id,
         "ref": req.ref,
@@ -1779,6 +1801,7 @@ def closeout_report(session: Session, engagement_id: int) -> dict:
         "material_rows": material_rows,
         "routine_rows": [x for x in rows if not x["material"]],
         "gate": gate,
+        "effects": {k: sum(1 for x in rows if x["effect"] == k) for k in ("scope", "representation", "nothing")},
         "open_now": sum(1 for r in requests if r.is_open) if not closed else 0,
         "now": now,
     }
@@ -2124,18 +2147,19 @@ def revoke_client_token(session: Session, token_id: int, actor: str) -> ClientTo
 
 
 def resolve_token(session: Session, token_str: str) -> tuple[ClientToken, Engagement]:
-    """The link and its engagement, or a TokenError saying why it cannot be used."""
+    """The link and its engagement, or a TokenError saying why it cannot be used. A closed
+    engagement is reported as closed even though closing also withdrew its links."""
     token = session.execute(select(ClientToken).where(ClientToken.token == (token_str or ""))).scalar_one_or_none()
     if token is None:
         raise TokenError("invalid", "This link is not valid. Please check you opened the whole link, or ask us to send it again.")
+    eng = session.get(Engagement, token.engagement_id)
+    if eng is None or eng.status != "Active":
+        raise TokenError("closed", "This engagement has been closed, so documents can no longer be received through this link.")
     status = token.status()
     if status == "revoked":
         raise TokenError("revoked", "This link has been withdrawn. Please ask us for a new one.")
     if status == "expired":
         raise TokenError("expired", "This link has expired. Please ask us to send a fresh one.")
-    eng = session.get(Engagement, token.engagement_id)
-    if eng is None or eng.status != "Active":
-        raise TokenError("closed", "This engagement has been closed, so documents can no longer be received through this link.")
     return token, eng
 
 
@@ -2516,13 +2540,28 @@ def publish_template_version(
     session: Session,
     engagement_type: str,
     actor: str,
-    label_edits: dict[int, Optional[str]],
+    label_edits: Optional[dict] = None,
     note: Optional[str] = None,
+    *,
+    item_edits: Optional[dict] = None,
+    removals: Optional[set] = None,
+    additions: Optional[list] = None,
 ) -> RequestTemplate:
-    """Publish version N+1 of a template with new client-facing labels (`label_text`). Every other
-    field is copied as it was. Earlier versions are never touched, so engagements that already used
-    them keep the wording they were asked in. `label_edits` maps template-item id -> new label."""
+    """Publish version N+1 of a template. The firm maintains the list: per item it can change the
+    client-facing wording (`label_text`), the significance, the priority and the entity condition;
+    it can remove items and add new ones. Everything else is copied as it was. Earlier versions are
+    never touched, so engagements already built from them keep the wording they were asked in.
+
+      label_edits  template-item id -> new label ('' clears it)
+      item_edits   template-item id -> {"significance", "priority", "condition"} (any subset)
+      removals     template-item ids to leave out of the new version
+      additions    [{"document", "label", "significance", "priority", "condition", "period"}]
+    """
+    from conditions import validate_condition
+
     actor = _require_actor(actor)
+    label_edits, item_edits = label_edits or {}, item_edits or {}
+    removals, additions = set(removals or ()), list(additions or ())
     if engagement_type not in ENGAGEMENT_TYPES:
         raise LedgerError(f"Unknown engagement type '{engagement_type}'.")
     try:
@@ -2535,30 +2574,81 @@ def publish_template_version(
         if latest_id is None:
             raise NotFoundError(f"No requirement-list template for '{engagement_type}'.")
         latest = get_template(session, engagement_type)
-        new_items, changed = [], 0
+        by_id = {i.id: i for i in latest.items}
+        unknown = (set(label_edits) | set(item_edits) | removals) - set(by_id)
+        if unknown:
+            raise LedgerError("Some template items are not part of the latest version - reload the manager.")
+
+        def checked(doc: str, label, significance, priority, condition, period) -> dict:
+            if significance not in SIGNIFICANCE:
+                raise LedgerError(f"'{doc}': significance must be Material or Routine.")
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError) as exc:
+                raise LedgerError(f"'{doc}': priority must be a number from 1 to 5.") from exc
+            if not 1 <= priority <= 5:
+                raise LedgerError(f"'{doc}': priority must be between 1 (highest) and 5.")
+            if period not in ("engagement", "as_at", "none"):
+                raise LedgerError(f"'{doc}': period must be engagement, as_at or none.")
+            condition = _clean(condition)
+            try:
+                validate_condition(condition)
+            except ConditionError as exc:
+                raise LedgerError(f"'{doc}': {exc}") from exc
+            label = _clean(label)
+            if label and len(label) > 2000:
+                raise LedgerError(f"The label for '{doc}' is too long (2000 characters maximum).")
+            return {"label": label, "significance": significance, "priority": priority,
+                    "condition": condition, "period": period}
+
+        rows, changed = [], 0
         for item in latest.items:
-            label = item.label_text
-            if item.id in label_edits:
-                edited = _clean(label_edits[item.id])
-                if edited and len(edited) > 2000:
-                    raise LedgerError(f"The label for '{item.document}' is too long (2000 characters maximum).")
-                if edited != _clean(item.label_text):
-                    label, changed = edited, changed + 1
-            new_items.append(
-                TemplateItem(
-                    position=item.position, document=item.document, description=item.description,
-                    label_text=label, condition_expr=item.condition_expr,
-                    significance_default=item.significance_default, priority_default=item.priority_default,
-                    period_mode=item.period_mode,
-                )
+            if item.id in removals:
+                changed += 1
+                continue
+            edits = item_edits.get(item.id, {})
+            new = checked(
+                item.document,
+                label_edits[item.id] if item.id in label_edits else item.label_text,
+                edits.get("significance", item.significance_default),
+                edits.get("priority", item.priority_default),
+                edits["condition"] if "condition" in edits else item.condition_expr,
+                item.period_mode,
             )
+            if (new["label"] != _clean(item.label_text) or new["significance"] != item.significance_default
+                    or new["priority"] != item.priority_default or new["condition"] != _clean(item.condition_expr)):
+                changed += 1
+            rows.append((item.document, item.description, new))
+        taken = {_normalise_document(r[0]) for r in rows}
+        for add in additions:
+            doc = _clean(add.get("document"))
+            if not doc:
+                continue
+            if len(doc) > 300:
+                raise LedgerError("A document name can be at most 300 characters.")
+            if _normalise_document(doc) in taken or _normalise_document(doc) in {
+                _normalise_document(i.document) for i in latest.items
+            }:
+                raise LedgerError(f"'{doc}' is already in this template.")
+            new = checked(doc, add.get("label"), add.get("significance") or "Routine", add.get("priority") or 3,
+                          add.get("condition"), add.get("period") or "engagement")
+            taken.add(_normalise_document(doc))
+            rows.append((doc, None, new))
+            changed += 1
         if not changed:
-            raise LedgerError("No label was changed - there is nothing to publish.")
+            raise LedgerError("Nothing was changed - there is nothing to publish.")
+        if not rows:
+            raise LedgerError("A template needs at least one item.")
         tmpl = RequestTemplate(
             engagement_type=engagement_type, version=latest.version + 1, title=latest.title,
-            published_by=actor, change_note=_clean(note) or f"{changed} label{'s' if changed != 1 else ''} edited",
+            published_by=actor, change_note=_clean(note) or f"{changed} change{'s' if changed != 1 else ''}",
         )
-        tmpl.items.extend(new_items)
+        for pos, (doc, description, new) in enumerate(rows, start=1):
+            tmpl.items.append(TemplateItem(
+                position=pos, document=doc, description=description, label_text=new["label"],
+                condition_expr=new["condition"], significance_default=new["significance"],
+                priority_default=new["priority"], period_mode=new["period"],
+            ))
         session.add(tmpl)
         session.commit()
         return tmpl

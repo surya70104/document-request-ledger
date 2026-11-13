@@ -1579,3 +1579,286 @@ def test_engagement_whatsapp_settings_are_validated_and_normalised(session, wa, 
     services.update_engagement_settings(session, eng.id, client_email="c@client.example")
     session.expire_all()
     assert services.get_engagement(session, eng.id).client_whatsapp == wa.c
+
+
+# ============================================================================================
+# End-to-end audit against the specification
+# ============================================================================================
+SPEC_STATES = ["Drafted", "Sent", "Acknowledged", "Submitted", "Under review", "Accepted", "Rejected",
+               "Re-requested", "Waived", "Not applicable", "Unfulfilled at report date"]
+
+
+def test_eleven_spec_states_and_strict_transitions(session, make_engagement, make_request):
+    from models import ALL_EVENT_TYPES, EVENT_STATE, STATES
+
+    # Section 3: exactly these eleven states (there is no "Partially received" in the specification)
+    assert STATES == SPEC_STATES and set(EVENT_STATE.values()) == set(SPEC_STATES)
+    assert services.ALLOWED_NEXT["Rejected"] == {"RE_REQUESTED"}, "a rejection always leads to the re-request"
+
+    def build(state):
+        eng = make_engagement()
+        req = make_request(eng, f"Doc for {state}", send=state != "Drafted")
+        if state in ("Acknowledged", "Submitted", "Under review"):
+            services.append_event(session, req.id, "ACKNOWLEDGED", "T", channel="Email")
+        if state in ("Submitted", "Under review", "Accepted", "Re-requested"):
+            sub = services.record_submission(session, req.id, "C", [("a.pdf", state.encode())])["submission"]
+            if state == "Under review":
+                services.append_event(session, req.id, "UNDER_REVIEW", "T")
+            if state == "Accepted":
+                services.review_submission(session, sub.id, "accept", "R")
+            if state == "Re-requested":
+                services.review_submission(session, sub.id, "reject", "R", reason_code="UNSIGNED")
+        if state == "Waived":
+            services.append_event(session, req.id, "WAIVED", "P", payload={"reason": "not needed"})
+        if state == "Not applicable":
+            services.append_event(session, req.id, "NOT_APPLICABLE", "P", payload={"reason": "no such account"})
+        if state == "Unfulfilled at report date":
+            services.close_engagement(session, eng.id, "P")
+        assert services.get_request(session, req.id).state == state
+        assert re.fullmatch(r"REQ-\d{3}-\d{3}", req.ref), "the unit of record is the request, REQ-XXX-NNN"
+        return req
+
+    checked = 0
+    for state in SPEC_STATES:
+        if state == "Rejected":
+            continue  # never a resting state: the REJECTED event is followed at once by RE_REQUESTED
+        req = build(state)
+        before = len(services.get_request(session, req.id).events)
+        allowed = services.ALLOWED_NEXT[state] - services.SYSTEM_ONLY
+        for et in ALL_EVENT_TYPES:
+            if et in allowed:
+                continue
+            with pytest.raises(services.InvalidTransition):
+                services.append_event(session, req.id, et, "T", channel="Email",
+                                      payload={"reason": "x", "note": "x", "reason_code": "UNSIGNED"})
+            checked += 1
+        assert len(services.get_request(session, req.id).events) == before, f"{state}: a refused move writes nothing"
+    assert checked > 60
+
+    # the moves the specification singles out
+    eng = make_engagement()
+    r = make_request(eng, "One")
+    with pytest.raises(services.InvalidTransition):
+        services.append_event(session, r.id, "ACCEPTED", "T")  # nothing has arrived to accept
+    sub = services.record_submission(session, r.id, "C", [("x.pdf", b"x")])["submission"]
+    ev = services.review_submission(session, sub.id, "reject", "R", reason_code="ILLEGIBLE")
+    assert [e.event_type for e in ev] == ["REJECTED", "RE_REQUESTED"] and services.get_request(session, r.id).attempt_count == 2
+
+
+def test_closed_engagement_is_locked_by_the_database_itself(session, engine_db, make_engagement, make_request, client):
+    eng = make_engagement(client_email="c@client.example")
+    req = make_request(eng, "Ledgers")
+    services.record_chase(session, req.id, "Arjun", "Email", template="gentle")
+    services.record_submission(session, req.id, "Client", [("a.pdf", b"same")])
+    services.record_submission(session, req.id, "Client", [("b.pdf", b"same")])  # an arrival
+    link = services.create_client_token(session, eng.id, "Priya")
+    other_link = services.create_client_token(session, eng.id, "Priya", owner_person="Owner One")
+    ids = {"e": eng.id, "r": req.id, "t": link.id}
+    sub_id = services.get_request(session, req.id).submissions[0].id
+    file_id = services.get_request(session, req.id).submissions[0].files[0].id
+
+    services.close_engagement(session, eng.id, "Partner")
+    session.expire_all()
+    assert session.get(ClientToken, link.id).status() == "revoked" and session.get(ClientToken, other_link.id).status() == "revoked", \
+        "closing withdraws every client link"
+    assert client.get(f"/c/{link.token}").status_code == 410
+
+    inserts = {
+        "request": "INSERT INTO request (engagement_id, ref, document, significance, priority, owner_person, created_by, created_at) "
+                   "VALUES (:e, 'REQ-X-1', 'd', 'Routine', 3, 'o', 'c', now())",
+        "request_event": "INSERT INTO request_event (request_id, seq, event_type, actor, at, payload) "
+                         "VALUES (:r, 99, 'NOTE', 'x', now(), CAST('{}' AS jsonb))",
+        "submission": "INSERT INTO submission (request_id, attempt_number, received_at, channel, outcome) "
+                      "VALUES (:r, 9, now(), 'Email', 'pending')",
+        "submission_file": "INSERT INTO submission_file (submission_id, request_id, filename, content_hash, file_bytes_size, "
+                           "storage_path, page_order, retention_basis) VALUES (:s, :r, 'f', 'h', 1, 'p', 9, 'none')",
+        "arrival": "INSERT INTO arrival (submission_file_id, arrived_at, channel) VALUES (:f, now(), 'Email')",
+        "chase": 'INSERT INTO chase (request_id, at, channel, "by", delivered, opened) VALUES (:r, now(), \'Email\', \'x\', false, false)',
+        "client_token": "INSERT INTO client_token (engagement_id, token, expires_at, created_by, created_at) "
+                        "VALUES (:e, 'sneaky', now() + interval '1 day', 'x', now())",
+    }
+    params = {**ids, "s": sub_id, "f": file_id}
+    session.rollback()
+    for table, statement in inserts.items():
+        with pytest.raises(DBAPIError, match="closed"):
+            with engine_db.begin() as conn:
+                conn.execute(text(statement), params)
+    for statement in ("UPDATE client_token SET revoked_at = NULL WHERE id = :t",
+                      "UPDATE engagement SET status = 'Active' WHERE id = :e",
+                      "UPDATE request_event SET actor = 'x' WHERE request_id = :r"):
+        with pytest.raises(DBAPIError):
+            with engine_db.begin() as conn:
+                conn.execute(text(statement), params)
+    # and the application says so in words
+    for attempt in (lambda: services.create_client_token(session, eng.id, "P"),
+                    lambda: services.create_request(session, engagement_id=eng.id, document="n", owner_person="o", actor="a"),
+                    lambda: services.record_submission(session, req.id, "C", [("c.pdf", b"same")])):
+        with pytest.raises(services.LedgerError):
+            attempt()
+
+
+def test_content_hash_dedup_is_one_engine_for_every_channel(session, wa, make_engagement, make_request, client):
+    eng = _wa_eng(make_engagement, wa)
+    req = make_request(eng, "Bank statement")
+    token = services.create_client_token(session, eng.id, "Priya").token
+    data = b"%PDF-1.4 the very same statement"
+
+    assert client.post(f"/c/{token}/requests/{req.id}/upload", files={"files": ("portal.pdf", data)}).status_code == 200
+    services.record_submission(session, req.id, "Staff", [("emailed-copy.pdf", data)], channel="Email", submitted_by="Ravi (by email)")
+    client.post(f"/c/{token}/requests/{req.id}/upload", files={"files": ("again.pdf", data)})
+    out = services.receive_whatsapp(session, phone=wa.c, text=req.ref, media=[("whatsapp-copy.pdf", "application/pdf", data)],
+                                    received_at=utcnow() + timedelta(seconds=5), final=True)
+    assert out["status"] == "duplicate"
+
+    got = services.get_request(session, req.id)
+    assert len(got.submissions) == 1 and len(got.submissions[0].files) == 1, "one submission, one stored file"
+    f = got.submissions[0].files[0]
+    assert [a.channel for a in f.arrivals] == ["Email", "Tokenised link", "WhatsApp"], "every re-send is an arrival, whatever the channel"
+    assert [e.event_type for e in got.events].count("ARRIVAL_RECORDED") == 3
+    assert [e.event_type for e in got.events].count("SUBMITTED") == 1
+
+
+def test_carry_forward_is_explicit_linked_and_never_a_blind_copy(session, make_engagement):
+    client_name = f"Carry Audit {uuid.uuid4().hex[:6]}"
+    prior = make_engagement(client_name=client_name, period_from=date(2024, 4, 1), period_to=date(2025, 3, 31))
+    services.generate_requests(session, engagement_id=prior.id, engagement_type="Statutory audit", actor="P",
+                               default_owner="Old Owner (Accountant)")
+    p = {r.document: r for r in services.engagement_requests(session, prior.id)}
+    tb, bank = p["Trial balance as at 31 March 2025"], p["Bank statements - all current accounts"]
+    for r in (tb, bank):
+        services.append_event(session, r.id, "SENT", "P", channel="Email")
+    sub = services.record_submission(session, tb.id, "C", [("tb.xlsx", b"tb")])["submission"]
+    services.review_submission(session, sub.id, "accept", "R")
+    services.append_event(session, bank.id, "WAIVED", "Partner", payload={"reason": "confirmed directly"})
+    services.close_engagement(session, prior.id, "Partner")
+    prior_events = {r.id: len(services.get_request(session, r.id).events) for r in services.engagement_requests(session, prior.id)}
+
+    # without the explicit choice nothing is linked or tagged
+    plain = make_engagement(client_name=client_name)
+    services.generate_requests(session, engagement_id=plain.id, engagement_type="Statutory audit", actor="P", default_owner="X (Acc)")
+    assert all(r.carried_from_request_id is None and "carried_forward" not in r.events[0].payload
+               for r in services.engagement_requests(session, plain.id))
+
+    # with it: the user picks the items; waived-last-year items start unticked; nothing is copied blindly
+    current = make_engagement(client_name=client_name)
+    plan = services.build_requirement_list(session, current.id, "Statutory audit", carry_forward=True)
+    rows = {r["item"].document: r for r in plan["rows"] if r["status"] == "create"}
+    assert rows["Bank statements - all current accounts"]["default_include"] is False
+    assert rows["Trial balance as at {period_end}"]["default_include"] is True
+    only_tb = {rows["Trial balance as at {period_end}"]["item"].id: {"include": True, "owner_person": "", "significance": "Material", "priority": 1}}
+    out = services.generate_requests(session, engagement_id=current.id, engagement_type="Statutory audit", actor="P",
+                                     default_owner="Fallback (Acc)", selections=only_tb, carry_forward=True)
+    assert [c["document"] for c in out["created"]] == ["Trial balance as at 31 March 2026"], "only what was selected"
+    new = services.get_request(session, out["created"][0]["id"])
+    assert new.carried_from_request_id == tb.id and new.ref != tb.ref and new.engagement_id == current.id
+    assert new.state == "Drafted" and len(new.events) == 1 and new.submissions == [], "a fresh request, not last year's history"
+    assert new.events[0].payload["carried_forward"].startswith("Same as last year")
+    # last year is untouched
+    assert services.get_request(session, tb.id).state == "Accepted" and services.get_request(session, bank.id).state == "Waived"
+    assert {r.id: len(services.get_request(session, r.id).events) for r in services.engagement_requests(session, prior.id)} == prior_events
+
+
+def test_eqr_readiness_and_unfulfilled_apis_and_report_effects(session, make_engagement, make_request, client):
+    eng = make_engagement()
+    material = make_request(eng, "Trial balance", significance="Material")
+    routine = make_request(eng, "Board minutes")
+    never_sent = make_request(eng, "Draft only", significance="Material", send=False)
+
+    r = client.get(f"/api/engagements/{eng.id}/eqr-readiness").json()
+    assert r["blocked"] and not r["passed"] and r["message"].startswith("BLOCKED: 2 material requests")
+    assert {b["ref"] for b in r["blockers"]} == {material.ref, never_sent.ref}
+    chip = client.get(f"/?eng={eng.id}").text
+    assert 'id="eqr-chip"' in chip and "EQR readiness: BLOCKED" in chip
+
+    services.close_engagement(session, eng.id, "Partner")
+    out = client.get(f"/api/engagements/{eng.id}/unfulfilled").json()
+    assert out["frozen"] and out["counts"]["unfulfilled"] == 3 and out["report_date"]
+    effects = {i["ref"]: i["effect"] for i in out["items"]}
+    assert effects == {material.ref: "scope", routine.ref: "representation", never_sent.ref: "nothing"}
+    assert out["effects"] == {"scope": 1, "representation": 1, "nothing": 1}
+    page = client.get(f"/engagements/{eng.id}/close-out").text
+    for label in ("Scope limitation to consider", "Representation to obtain", "Nothing", "What it does to the report"):
+        assert label in page
+    assert client.get(f"/api/engagements/{eng.id}/eqr-readiness").json()["message"].startswith("BLOCKED: 2 material")
+
+    # nothing material outstanding: the gate passes
+    ok = make_engagement()
+    make_request(ok, "Minutes only")
+    assert client.get(f"/api/engagements/{ok.id}/eqr-readiness").json()["passed"] is True
+    assert client.get(f"/api/engagements/{ok.id}/unfulfilled").json()["frozen"] is False
+    assert client.get("/api/engagements/999999/eqr-readiness").status_code == 404
+
+
+def test_the_firm_maintains_templates_beyond_wording(session, make_engagement, client):
+    etype = "Bank audit"
+    v1 = services.get_template(session, etype)
+    first = next(i for i in v1.items if i.document == "Sanction letter and loan terms")
+    drop = next(i for i in v1.items if i.document == "Insurance policies covering stock and assets")
+    snapshot = [(i.document, i.label_text, i.significance_default, i.priority_default, i.condition_expr) for i in v1.items]
+
+    for bad, msg in [
+        (dict(item_edits={first.id: {"condition": "__import__('os').system('x')"}}), "."),
+        (dict(item_edits={first.id: {"priority": 9}}), "priority"),
+        (dict(item_edits={first.id: {"significance": "Huge"}}), "significance"),
+        (dict(additions=[{"document": "insurance POLICIES covering stock and assets"}]), "already in this template"),
+        (dict(additions=[{"document": "Fresh", "condition": "no_such_flag"}]), "."),
+        (dict(removals={i.id for i in v1.items}), "at least one item"),
+        (dict(removals={10 ** 9}), "not part of the latest"),
+        (dict(), "nothing to publish"),
+    ]:
+        with pytest.raises(services.LedgerError, match=msg):
+            services.publish_template_version(session, etype, "Priya", **bad)
+
+    v2 = services.publish_template_version(
+        session, etype, "Priya", {}, "Reworked for stock-heavy borrowers",
+        item_edits={first.id: {"significance": "Material", "priority": 1, "condition": "has_inventory and has_borrowings"}},
+        removals={drop.id},
+        additions=[{"document": "Insurance schedule and renewal receipts", "label": "Your current insurance schedule",
+                    "significance": "Routine", "priority": 4, "condition": "has_fixed_assets", "period": "none"}],
+    )
+    assert v2.version == v1.version + 1 and v2.change_note == "Reworked for stock-heavy borrowers"
+    docs = [i.document for i in v2.items]
+    assert drop.document not in docs and docs[-1] == "Insurance schedule and renewal receipts" and len(docs) == len(v1.items)
+    assert [i.position for i in v2.items] == list(range(1, len(docs) + 1))
+    edited = next(i for i in v2.items if i.document == first.document)
+    assert (edited.significance_default, edited.priority_default, edited.condition_expr) == ("Material", 1, "has_inventory and has_borrowings")
+    added = v2.items[-1]
+    assert (added.label_text, added.priority_default, added.condition_expr, added.period_mode) == \
+        ("Your current insurance schedule", 4, "has_fixed_assets", "none")
+    session.expire_all()
+    assert [(i.document, i.label_text, i.significance_default, i.priority_default, i.condition_expr)
+            for i in services.get_template(session, etype, v1.version).items] == snapshot, "v1 is untouched"
+
+    # new engagements use the new list; entity conditioning applies to the edited and added items
+    heavy = make_engagement(engagement_type=etype, client_name="Heavy", profile={"has_inventory": True, "has_borrowings": True, "has_fixed_assets": True})
+    services.generate_requests(session, engagement_id=heavy.id, engagement_type=etype, actor="P", default_owner="O (Acc)")
+    made = {r.document: r for r in services.engagement_requests(session, heavy.id)}
+    assert made[first.document].significance == "Material" and made[first.document].priority == 1
+    assert drop.document not in made and "Insurance schedule and renewal receipts" in made
+    light = make_engagement(engagement_type=etype, client_name="Light", profile={"has_borrowings": True})
+    res = services.generate_requests(session, engagement_id=light.id, engagement_type=etype, actor="P", default_owner="O (Acc)")
+    assert first.document not in {r.document for r in services.engagement_requests(session, light.id)}
+    assert any(s["document"] == first.document and s["basis"].startswith("Suppressed:") for s in res["suppressed"])
+
+    # the manager screen and its endpoint
+    session.rollback()
+    page = client.get(f"/templates/manager?type={etype}")
+    assert "Add an item" in page.text and 'name="remove"' in page.text and 'name="condition"' in page.text
+    old = client.get(f"/templates/manager?type={etype}&version={v1.version}")
+    assert "read-only" in old.text and 'name="remove"' not in old.text
+    latest = services.get_template(session, etype)
+    ids = [i.id for i in latest.items]
+    form = {"type": etype, "actor": "Priya", "item_id": ids, "label": [i.label_text or "" for i in latest.items],
+            "significance": [i.significance_default for i in latest.items], "priority": [str(i.priority_default) for i in latest.items],
+            "condition": [i.condition_expr or "" for i in latest.items], "add_document": ["Via the form"], "add_label": ["Typed in the manager"],
+            "add_significance": ["Material"], "add_priority": ["2"], "add_condition": [""], "add_period": ["engagement"]}
+    res = client.post("/templates/publish", data=form)
+    assert res.status_code == 200 and res.json()["version"] == v2.version + 1
+    session.expire_all()
+    newest = services.get_template(session, etype)
+    form2 = {"type": etype, "actor": "Priya", "item_id": [i.id for i in newest.items], "label": [i.label_text or "" for i in newest.items],
+             "significance": [i.significance_default for i in newest.items], "priority": [str(i.priority_default) for i in newest.items],
+             "condition": [i.condition_expr or "" for i in newest.items]}
+    nothing = client.post("/templates/publish", data=form2)
+    assert nothing.status_code == 400 and "nothing to publish" in nothing.json()["error"]
+    assert client.post("/templates/publish", data={**form2, "add_document": ["Bad"], "add_condition": ["x y z"]}).status_code == 400
